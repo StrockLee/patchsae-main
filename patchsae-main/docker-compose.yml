@@ -1,0 +1,23 @@
+services:
+  patchsae:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: patchsae:cuda12.1
+    container_name: patchsae-gpu
+    working_dir: /workspace
+    command: ["bash", "-lc", "sleep infinity"]
+    stdin_open: true
+    tty: true
+    gpus: all
+    ipc: host
+    shm_size: "16gb"
+    environment:
+      PYTHONPATH: /workspace
+      HF_HOME: /workspace/data/hf_cache
+      HF_DATASETS_CACHE: /workspace/data/hf_cache/datasets
+      TRANSFORMERS_CACHE: /workspace/data/hf_cache/transformers
+      WANDB_DIR: /workspace/out/wandb
+      MPLCONFIGDIR: /workspace/out/matplotlib
+    volumes:
+      - ./:/workspace
