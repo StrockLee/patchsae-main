@@ -13,6 +13,7 @@ from src.sae_training.hooked_vit import Hook, HookedVisionTransformer
 from src.sae_training.sparse_autoencoder import SparseAutoencoder
 from tasks.utils import (
     SAE_DIM,
+    filter_data_by_split,
     get_sae_and_vit,
     load_and_organize_dataset,
     process_batch,
@@ -174,13 +175,20 @@ def main(
     model_path: str = None,
     config_path: str = None,
     cls_wise_sae_activation_path: str = None,
+    split: str = "all",
 ):
     class_feature_type = cls_wise_sae_activation_path.split("/")[-3]
+    save_suffix = (
+        f"{class_feature_type}_{vit_type}"
+        if split == "all"
+        else f"{class_feature_type}_{vit_type}_{split}"
+    )
     save_directory = setup_save_directory(
-        root_dir, save_name, sae_path, f"{class_feature_type}_{vit_type}", dataset_name
+        root_dir, save_name, sae_path, save_suffix, dataset_name
     )
 
     classnames, data_by_class = load_and_organize_dataset(dataset_name)
+    classnames, data_by_class = filter_data_by_split(classnames, data_by_class, split)
 
     sae, vit, cfg = get_sae_and_vit(
         sae_path,
@@ -193,6 +201,12 @@ def main(
     )
 
     cls_sae_cnt = np.load(cls_wise_sae_activation_path)
+    if cls_sae_cnt.shape[0] != len(classnames):
+        raise ValueError(
+            "Mismatch between class split and cls_sae_cnt rows. "
+            f"Got {cls_sae_cnt.shape[0]} rows, expected {len(classnames)} "
+            f"for split='{split}'."
+        )
 
     if vit_type == "base":
         text_features = calculate_text_features(vit, device, classnames)
@@ -252,6 +266,13 @@ if __name__ == "__main__":
         help="CLIP config path in the case of using maple",
     )
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="all",
+        choices=["all", "base", "novel"],
+        help="Class split for base-to-novel evaluation",
+    )
 
     args = parser.parse_args()
 
@@ -266,4 +287,5 @@ if __name__ == "__main__":
         model_path=args.model_path,
         config_path=args.config_path,
         cls_wise_sae_activation_path=args.cls_wise_sae_activation_path,
+        split=args.split,
     )

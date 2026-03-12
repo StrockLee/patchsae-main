@@ -41,6 +41,9 @@ class SparseAutoencoder(HookedRootModule):
         self.l1_coefficient = cfg.l1_coefficient
         self.dtype = cfg.dtype
         self.device = device
+        self.norm_eps = getattr(cfg, "norm_eps", 1e-6)
+        self.ghost_grad_exp_clamp_max = getattr(cfg, "ghost_grad_exp_clamp_max", 20.0)
+        self.debug_numerics = bool(getattr(cfg, "debug_numerics", False))
 
         # NOTE: if using resampling neurons method, you must ensure that we initialise the weights in the order W_enc, b_enc, W_dec, b_dec
         self.W_enc = nn.Parameter(
@@ -69,7 +72,9 @@ class SparseAutoencoder(HookedRootModule):
 
         with torch.no_grad():
             # Anthropic normalize this to have unit columns
-            self.W_dec.data /= torch.norm(self.W_dec.data, dim=1, keepdim=True)
+            self.W_dec.data /= torch.norm(self.W_dec.data, dim=1, keepdim=True).clamp_min(
+                self.norm_eps
+            )
 
         self.b_dec = nn.Parameter(
             torch.zeros(self.d_in, dtype=self.dtype, device=self.device)
@@ -82,6 +87,23 @@ class SparseAutoencoder(HookedRootModule):
 
         self.setup()  # Required for `HookedRootModule`s
 
+    def _check_finite(self, tensor: Tensor, name: str) -> None:
+        if not self.debug_numerics:
+            return
+        finite_mask = torch.isfinite(tensor)
+        if finite_mask.all():
+            return
+        finite_vals = tensor[finite_mask]
+        finite_min = finite_vals.min().item() if finite_vals.numel() > 0 else float("nan")
+        finite_max = finite_vals.max().item() if finite_vals.numel() > 0 else float("nan")
+        bad_count = (~finite_mask).sum().item()
+        total = tensor.numel()
+        raise FloatingPointError(
+            f"Non-finite tensor detected at {name}. "
+            f"dtype={tensor.dtype}, shape={tuple(tensor.shape)}, "
+            f"bad={bad_count}/{total}, finite_min={finite_min}, finite_max={finite_max}"
+        )
+
     def forward(self, x, dead_neuron_mask=None):
         if self.cfg.gated_sae:
             return self.forward_gated(x, dead_neuron_mask)
@@ -90,10 +112,12 @@ class SparseAutoencoder(HookedRootModule):
 
     def forward_standard(self, x, dead_neuron_mask=None):
         x = x.to(self.dtype)
+        self._check_finite(x, "x")
 
         sae_in = self.hook_sae_in(
             x - self.b_dec
         )  # Remove encoder bias as per Anthropic
+        self._check_finite(sae_in, "sae_in")
 
         hidden_pre = self.hook_hidden_pre(
             einops.einsum(
@@ -103,7 +127,9 @@ class SparseAutoencoder(HookedRootModule):
             )
             + self.b_enc
         )
+        self._check_finite(hidden_pre, "hidden_pre")
         feature_acts = self.hook_hidden_post(torch.nn.functional.relu(hidden_pre))
+        self._check_finite(feature_acts, "feature_acts")
 
         sae_out = self.hook_sae_out(
             einops.einsum(
@@ -113,59 +139,94 @@ class SparseAutoencoder(HookedRootModule):
             )
             + self.b_dec
         )
+        self._check_finite(sae_out, "sae_out")
 
         # add config for whether l2 is normalized:
-        mse_loss = (
-            torch.pow((sae_out - x.float()), 2)
-            / (x**2).sum(dim=-1, keepdim=True).sqrt()
+        x_float = x.float()
+        x_norm = x_float.pow(2).sum(dim=-1, keepdim=True).sqrt().clamp_min(
+            self.norm_eps
         )
+        mse_loss = (
+            torch.pow((sae_out.float() - x_float), 2)
+            / x_norm
+        )
+        self._check_finite(mse_loss, "mse_loss_pre_cls_scale")
 
         mse_loss_ghost_resid = torch.tensor(0.0, dtype=self.dtype, device=self.device)
         # gate on config and training so evals is not slowed down.
-        if self.cfg.use_ghost_grads and self.training and dead_neuron_mask.sum() > 0:
-            assert dead_neuron_mask is not None
+        if (
+            self.cfg.use_ghost_grads
+            and self.training
+            and dead_neuron_mask is not None
+            and dead_neuron_mask.any()
+        ):
 
             # ghost protocol
 
             # 1.
-            residual = x - sae_out
+            residual = x_float - sae_out.float()
             l2_norm_residual = torch.norm(residual, dim=-1)
+            self._check_finite(residual, "ghost/residual")
 
             # 2.
             if len(hidden_pre.size()) == 3:
-                feature_acts_dead_neurons_only = torch.exp(
-                    hidden_pre[:, :, dead_neuron_mask]
+                dead_hidden_pre = hidden_pre[:, :, dead_neuron_mask].float()
+                dead_hidden_pre = dead_hidden_pre.clamp(
+                    max=self.ghost_grad_exp_clamp_max
                 )
             else:
-                feature_acts_dead_neurons_only = torch.exp(
-                    hidden_pre[:, dead_neuron_mask]
+                dead_hidden_pre = hidden_pre[:, dead_neuron_mask].float()
+                dead_hidden_pre = dead_hidden_pre.clamp(
+                    max=self.ghost_grad_exp_clamp_max
                 )
-            ghost_out = feature_acts_dead_neurons_only @ self.W_dec[dead_neuron_mask, :]
-            l2_norm_ghost_out = torch.norm(ghost_out, dim=-1)
-            norm_scaling_factor = l2_norm_residual / (1e-6 + l2_norm_ghost_out * 2)
+            feature_acts_dead_neurons_only = torch.exp(dead_hidden_pre)
+            self._check_finite(
+                feature_acts_dead_neurons_only, "ghost/feature_acts_dead_neurons_only"
+            )
+            ghost_out = feature_acts_dead_neurons_only @ self.W_dec[dead_neuron_mask, :].float()
+            l2_norm_ghost_out = torch.norm(ghost_out, dim=-1).clamp_min(self.norm_eps)
+            norm_scaling_factor = l2_norm_residual / (
+                self.norm_eps + l2_norm_ghost_out * 2
+            )
             if len(hidden_pre.size()) == 3:
                 ghost_out = ghost_out * norm_scaling_factor[:, :, None].detach()
             else:
                 ghost_out = ghost_out * norm_scaling_factor[:, None].detach()
+            self._check_finite(ghost_out, "ghost/ghost_out")
 
             # 3.
-            mse_loss_ghost_resid = (
-                torch.pow((ghost_out - residual.detach().float()), 2)
-                / (residual.detach() ** 2).sum(dim=-1, keepdim=True).sqrt()
+            residual_detached = residual.detach()
+            residual_norm = residual_detached.pow(2).sum(dim=-1, keepdim=True).sqrt().clamp_min(
+                self.norm_eps
             )
-            mse_rescaling_factor = (mse_loss / (mse_loss_ghost_resid + 1e-6)).detach()
+            mse_loss_ghost_resid = (
+                torch.pow((ghost_out - residual_detached), 2)
+                / residual_norm
+            )
+            mse_rescaling_factor = (
+                mse_loss.detach().float() / (mse_loss_ghost_resid + self.norm_eps)
+            ).detach()
+            mse_rescaling_factor = torch.nan_to_num(
+                mse_rescaling_factor, nan=0.0, posinf=0.0, neginf=0.0
+            )
             mse_loss_ghost_resid = mse_rescaling_factor * mse_loss_ghost_resid
+            self._check_finite(mse_loss_ghost_resid, "ghost/mse_loss_ghost_resid")
 
+        mse_loss_ghost_resid = torch.nan_to_num(
+            mse_loss_ghost_resid, nan=0.0, posinf=0.0, neginf=0.0
+        )
         mse_loss_ghost_resid = mse_loss_ghost_resid.mean()
 
         # mse_loss shape is (batch_size, token_length, sae_dim), then multiply mse_cls_coeff to [:, 0, :]
         if len(mse_loss.size()) == 3 and self.training:
             mse_loss[:, 0, :] = mse_loss[:, 0, :] * self.cfg.mse_cls_coefficient
 
+        mse_loss = torch.nan_to_num(mse_loss, nan=0.0, posinf=0.0, neginf=0.0)
         mse_loss = mse_loss.mean()
         sparsity = torch.abs(feature_acts).sum(dim=-1).mean(dim=(0,))
         l1_loss = self.l1_coefficient * sparsity
         loss = mse_loss + l1_loss + mse_loss_ghost_resid
+        self._check_finite(loss, "total_loss")
 
         loss_dict = {
             "mse_loss": mse_loss,
@@ -214,9 +275,13 @@ class SparseAutoencoder(HookedRootModule):
         )
 
         # add config for whether l2 is normalized:
+        x_float = x.float()
+        x_norm = x_float.pow(2).sum(dim=-1, keepdim=True).sqrt().clamp_min(
+            self.norm_eps
+        )
         mse_loss = (
-            torch.pow((sae_out - x.float()), 2)
-            / (x**2).sum(dim=-1, keepdim=True).sqrt()
+            torch.pow((sae_out.float() - x_float), 2)
+            / x_norm
         )
 
         mse_loss_ghost_resid = torch.tensor(0.0, dtype=self.dtype, device=self.device)
@@ -290,7 +355,7 @@ class SparseAutoencoder(HookedRootModule):
         )
         print(f"New distances: {distances.median(0).values.mean().item()}")
 
-        out = torch.tensor(out, dtype=self.dtype, device=self.device)
+        out = out.detach().to(dtype=self.dtype, device=self.device)
 
         # print('out.shape', out.shape)
         # print('self.b_dec.shape', self.b_dec.shape)
@@ -444,7 +509,7 @@ class SparseAutoencoder(HookedRootModule):
                 global_input_activations[sample_indices]
                 / torch.norm(
                     global_input_activations[sample_indices], dim=1, keepdim=True
-                )
+                ).clamp_min(self.norm_eps)
             )
             .to(self.dtype)
             .to(self.device)
@@ -613,7 +678,9 @@ class SparseAutoencoder(HookedRootModule):
 
     @torch.no_grad()
     def set_decoder_norm_to_unit_norm(self):
-        self.W_dec.data /= torch.norm(self.W_dec.data, dim=1, keepdim=True)
+        self.W_dec.data /= torch.norm(self.W_dec.data, dim=1, keepdim=True).clamp_min(
+            self.norm_eps
+        )
 
     @torch.no_grad()
     def remove_gradient_parallel_to_decoder_directions(self):

@@ -48,6 +48,15 @@ if __name__ == "__main__":
     parser.add_argument("--feature_sampling_window", type=int, default=64)
     parser.add_argument("--dead_feature_window", type=int, default=64)
     parser.add_argument("--dead_feature_threshold", type=float, default=1e-6)
+    parser.add_argument("--norm_eps", type=float, default=1e-6)
+    parser.add_argument("--ghost_grad_exp_clamp_max", type=float, default=20.0)
+    parser.add_argument("--debug_numerics", action="store_true", default=False)
+    parser.add_argument(
+        "--debug_dataset_size",
+        type=int,
+        default=0,
+        help="Use a small dataset subset for end-to-end NaN debugging.",
+    )
     # WANDB
     parser.add_argument("--log_to_wandb", action="store_true", default=None)
     parser.add_argument("--wandb_project", type=str, default="patch_sae")
@@ -79,12 +88,17 @@ if __name__ == "__main__":
         help="CLIP config path in the case of using maple",
     )
     args = parser.parse_args()
+    normalized_model_name = (
+        args.model_name
+        if args.model_name.startswith("openai/")
+        else f"openai/{args.model_name}"
+    )
 
     cfg = ViTSAERunnerConfig(
         class_token=args.class_token,
         image_width=args.image_width,
         image_height=args.image_height,
-        model_name=f"openai/{args.model_name}",
+        model_name=normalized_model_name,
         module_name=args.module_name,
         block_layer=args.block_layer,
         dataset_path=DATASET_INFO[args.dataset]["path"],
@@ -109,6 +123,9 @@ if __name__ == "__main__":
         feature_sampling_window=args.feature_sampling_window,
         dead_feature_window=args.dead_feature_window,
         dead_feature_threshold=args.dead_feature_threshold,
+        norm_eps=args.norm_eps,
+        ghost_grad_exp_clamp_max=args.ghost_grad_exp_clamp_max,
+        debug_numerics=args.debug_numerics,
         log_to_wandb=args.log_to_wandb,
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
@@ -123,6 +140,14 @@ if __name__ == "__main__":
     print("Loading dataset")
     classnames = get_classnames(args.dataset)
     dataset = load_dataset(**DATASET_INFO[args.dataset])
+    if args.debug_dataset_size and args.debug_dataset_size > 0:
+        debug_take_n = min(args.debug_dataset_size, len(dataset))
+        dataset = dataset.select(range(debug_take_n))
+        print(f"Debug subset enabled: using first {debug_take_n} samples.")
+
+    if args.debug_numerics:
+        torch.autograd.set_detect_anomaly(True)
+        print("Enabled torch.autograd anomaly detection.")
 
     print("Loading SAE and ViT models")
     sae = SparseAutoencoder(cfg, args.device)
@@ -130,7 +155,7 @@ if __name__ == "__main__":
     vit = load_hooked_vit(
         cfg,
         args.vit_type,
-        args.model_name,
+        normalized_model_name,
         args.device,
         args.model_path,
         args.config_path,

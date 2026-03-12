@@ -66,6 +66,31 @@ class SAETrainer:
         self.act_freq_scores = torch.zeros(self.cfg.d_sae, device=self.device)
         self.n_frac_active_tokens = 0
 
+    def _assert_finite_tensor(self, name: str, tensor: torch.Tensor) -> None:
+        if torch.isfinite(tensor).all():
+            return
+        finite_mask = torch.isfinite(tensor)
+        finite_vals = tensor[finite_mask]
+        finite_min = finite_vals.min().item() if finite_vals.numel() > 0 else float("nan")
+        finite_max = finite_vals.max().item() if finite_vals.numel() > 0 else float("nan")
+        bad_count = (~finite_mask).sum().item()
+        total = tensor.numel()
+        raise FloatingPointError(
+            f"Non-finite value detected in {name}. "
+            f"dtype={tensor.dtype}, shape={tuple(tensor.shape)}, "
+            f"bad={bad_count}/{total}, finite_min={finite_min}, finite_max={finite_max}"
+        )
+
+    def _assert_finite_losses(self, loss_dict: dict[str, torch.Tensor]) -> None:
+        for key, value in loss_dict.items():
+            self._assert_finite_tensor(f"loss_dict[{key}]", value)
+
+    def _assert_finite_gradients(self) -> None:
+        for name, param in self.sae.named_parameters():
+            if param.grad is None:
+                continue
+            self._assert_finite_tensor(f"grad[{name}]", param.grad)
+
     def _train_step(
         self,
         sae_in: torch.Tensor,
@@ -86,6 +111,7 @@ class SAETrainer:
             self.n_forward_passes_since_fired > self.cfg.dead_feature_window
         ).bool()
         sae_out, feature_acts, loss_dict = self.sae(sae_in, ghost_grad_neuron_mask)
+        self._assert_finite_losses(loss_dict)
 
         with torch.no_grad():
             if self.cfg.class_token:
@@ -104,7 +130,11 @@ class SAETrainer:
         self.ghost_grad_neuron_mask = ghost_grad_neuron_mask
 
         loss_dict["loss"].backward()
+        if getattr(self.cfg, "debug_numerics", False):
+            self._assert_finite_gradients()
         self.sae.remove_gradient_parallel_to_decoder_directions()
+        if getattr(self.cfg, "debug_numerics", False):
+            self._assert_finite_gradients()
 
         self.optimizer.step()
         self.scheduler.step()

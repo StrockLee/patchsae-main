@@ -106,6 +106,37 @@ def load_and_organize_dataset(dataset_name: str) -> Tuple[list, Dict]:
     return classnames, data_by_class
 
 
+def split_classnames(classnames: list[str], split: str) -> tuple[list[str], list[int]]:
+    """Split class names into base/novel subsets by class index order.
+
+    The split follows the paper protocol: first half is base, remaining is novel.
+    """
+    split = split.lower()
+    if split not in {"all", "base", "novel"}:
+        raise ValueError(f"Unsupported split: {split}. Use one of all/base/novel.")
+
+    if split == "all":
+        indices = list(range(len(classnames)))
+    else:
+        midpoint = len(classnames) // 2
+        if split == "base":
+            indices = list(range(midpoint))
+        else:
+            indices = list(range(midpoint, len(classnames)))
+
+    split_names = [classnames[i] for i in indices]
+    return split_names, indices
+
+
+def filter_data_by_split(
+    classnames: list[str], data_by_class: Dict, split: str
+) -> tuple[list[str], Dict]:
+    """Filter class-wise dataset dictionary with the selected class split."""
+    split_names, _ = split_classnames(classnames, split)
+    filtered_data = {classname: data_by_class[classname] for classname in split_names}
+    return split_names, filtered_data
+
+
 def get_classnames(
     dataset_name: str, dataset: Dataset = None, data_root: str = "./configs/classnames"
 ) -> list[str]:

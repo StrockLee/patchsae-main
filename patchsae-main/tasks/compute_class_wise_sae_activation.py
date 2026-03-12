@@ -12,6 +12,7 @@ from src.sae_training.sparse_autoencoder import SparseAutoencoder
 from src.sae_training.utils import get_model_activations
 from tasks.utils import (
     SAE_DIM,
+    filter_data_by_split,
     get_sae_and_vit,
     load_and_organize_dataset,
     process_batch,
@@ -114,14 +115,17 @@ def main(
     model_path: str = None,
     config_path: str = None,
     threshold: float = 0.2,
+    split: str = "all",
 ):
     """Main function to compute and save class-wise SAE activation counts."""
 
+    split_suffix = vit_type if split == "all" else f"{vit_type}_{split}"
     save_directory = setup_save_directory(
-        root_dir, save_name, sae_path, vit_type, dataset_name
+        root_dir, save_name, sae_path, split_suffix, dataset_name
     )
 
     classnames, data_by_class = load_and_organize_dataset(dataset_name)
+    classnames, data_by_class = filter_data_by_split(classnames, data_by_class, split)
 
     sae, vit, cfg = get_sae_and_vit(
         sae_path,
@@ -168,6 +172,13 @@ if __name__ == "__main__":
         help="CLIP config path in the case of using maple",
     )
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="all",
+        choices=["all", "base", "novel"],
+        help="Class split for base-to-novel evaluation",
+    )
 
     args = parser.parse_args()
 
@@ -182,4 +193,5 @@ if __name__ == "__main__":
         model_path=args.model_path,
         config_path=args.config_path,
         threshold=args.threshold,
+        split=args.split,
     )

@@ -85,6 +85,9 @@ class ViTSAERunnerConfig:
     dead_feature_window: int = 1000  # unless this window is larger feature sampling,
     dead_feature_estimation_method: str = "no_fire"
     dead_feature_threshold: float = 1e-8
+    norm_eps: float = 1e-6
+    ghost_grad_exp_clamp_max: float = 20.0
+    debug_numerics: bool = False
 
     # WANDB
     log_to_wandb: bool = True
@@ -155,6 +158,15 @@ class ViTSAERunnerConfig:
 
         if self.use_ghost_grads:
             print("Using Ghost Grads.")
+
+        if self.norm_eps <= 0:
+            raise ValueError(f"norm_eps must be > 0. Got {self.norm_eps}")
+        if self.ghost_grad_exp_clamp_max <= 0:
+            raise ValueError(
+                f"ghost_grad_exp_clamp_max must be > 0. Got {self.ghost_grad_exp_clamp_max}"
+            )
+        if self.debug_numerics:
+            print("Numerics debug mode is enabled.")
 
         print(
             f"We will reset the sparsity calculation {n_feature_window_samples} times."
