@@ -133,6 +133,7 @@ def classify_with_top_k_masking(
     dataset,
     class_indices: list[int],
     cls_idx: int,
+    class_name: str,
     sae: SparseAutoencoder,
     vit: HookedVisionTransformer,
     cls_sae_cnt: torch.Tensor,
@@ -141,6 +142,7 @@ def classify_with_top_k_masking(
     device: str,
     vit_type: str,
     cfg: Config,
+    show_inner_progress: bool = False,
 ):
     """Classify images with top-k feature masking."""
     num_batches = (len(class_indices) + batch_size - 1) // batch_size
@@ -148,7 +150,16 @@ def classify_with_top_k_masking(
     preds_dict = defaultdict(list)
     loaded_cls_sae_idx = cls_sae_cnt[cls_idx].argsort()[::-1]
 
-    for batch_idx in range(num_batches):
+    batch_iter = range(num_batches)
+    if show_inner_progress:
+        batch_iter = tqdm(
+            batch_iter,
+            total=num_batches,
+            desc=f"class {cls_idx} ({class_name})",
+            leave=False,
+        )
+
+    for batch_idx in batch_iter:
         batch_start = batch_idx * batch_size
         batch_end = min((batch_idx + 1) * batch_size, len(class_indices))
         batch_sample_indices = class_indices[batch_start:batch_end]
@@ -196,6 +207,7 @@ def main(
     config_path: str = None,
     cls_wise_sae_activation_path: str = None,
     split: str = "all",
+    show_inner_progress: bool = False,
 ):
     class_feature_type = cls_wise_sae_activation_path.split("/")[-3]
     save_suffix = (
@@ -241,6 +253,7 @@ def main(
             dataset,
             class_to_indices[class_idx],
             class_idx,
+            classname,
             sae,
             vit,
             cls_sae_cnt,
@@ -249,6 +262,7 @@ def main(
             device,
             vit_type,
             cfg,
+            show_inner_progress=show_inner_progress,
         )
 
         metrics_dict[class_idx] = {}
@@ -298,6 +312,12 @@ if __name__ == "__main__":
         choices=["all", "base", "novel"],
         help="Class split for base-to-novel evaluation",
     )
+    parser.add_argument(
+        "--show_inner_progress",
+        action="store_true",
+        default=False,
+        help="Show per-class batch-level progress bars.",
+    )
 
     args = parser.parse_args()
 
@@ -313,4 +333,5 @@ if __name__ == "__main__":
         config_path=args.config_path,
         cls_wise_sae_activation_path=args.cls_wise_sae_activation_path,
         split=args.split,
+        show_inner_progress=args.show_inner_progress,
     )

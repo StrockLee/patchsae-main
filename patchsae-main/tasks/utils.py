@@ -177,7 +177,19 @@ def setup_save_directory(
     root_dir: str, save_name: str, sae_path: str, vit_type: str, dataset_name: str
 ) -> str:
     """Set and create the save directory path."""
-    sae_run_name = sae_path.split("/")[-2]
+    if not sae_path or not str(sae_path).strip():
+        raise ValueError(
+            "sae_path is empty. Please pass a valid checkpoint path to --sae_path."
+        )
+
+    normalized_path = str(sae_path).replace("\\", "/")
+    path_parts = [part for part in normalized_path.split("/") if part]
+
+    if len(path_parts) >= 2:
+        sae_run_name = path_parts[-2]
+    else:
+        sae_run_name = os.path.splitext(path_parts[-1])[0]
+
     save_directory = (
         f"{root_dir}/{save_name}/sae_{sae_run_name}/{vit_type}/{dataset_name}"
     )
