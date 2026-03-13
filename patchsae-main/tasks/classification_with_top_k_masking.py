@@ -4,6 +4,7 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 import torch
+from datasets import load_dataset
 from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 
@@ -11,13 +12,14 @@ from src.models.templates.openai_imagenet_templates import openai_imagenet_templ
 from src.sae_training.config import Config
 from src.sae_training.hooked_vit import Hook, HookedVisionTransformer
 from src.sae_training.sparse_autoencoder import SparseAutoencoder
+from src.sae_training.utils import process_model_inputs
 from tasks.utils import (
+    DATASET_INFO,
     SAE_DIM,
-    filter_data_by_split,
+    get_classnames,
     get_sae_and_vit,
-    load_and_organize_dataset,
-    process_batch,
     setup_save_directory,
+    split_classnames,
 )
 
 TOPK_LIST = [1, 2, 5, 10, 50, 100, 500, 1000, 2000, SAE_DIM]
@@ -108,8 +110,28 @@ def get_predictions(vit, inputs, text_features, vit_type, hooks=None):
     return preds.cpu().numpy().tolist()
 
 
+def build_class_to_indices(dataset, selected_class_indices: list[int]) -> list[list[int]]:
+    """Build class -> sample-index mapping without storing full image objects."""
+    class_to_indices = [[] for _ in range(len(selected_class_indices))]
+    original_to_local = {
+        int(original_class_idx): local_idx
+        for local_idx, original_class_idx in enumerate(selected_class_indices)
+    }
+
+    labels = dataset["label"]
+    for sample_idx, label in enumerate(
+        tqdm(labels, desc="Indexing dataset by class", leave=False)
+    ):
+        local_idx = original_to_local.get(int(label))
+        if local_idx is not None:
+            class_to_indices[local_idx].append(sample_idx)
+
+    return class_to_indices
+
+
 def classify_with_top_k_masking(
-    class_data: list,
+    dataset,
+    class_indices: list[int],
     cls_idx: int,
     sae: SparseAutoencoder,
     vit: HookedVisionTransformer,
@@ -121,25 +143,23 @@ def classify_with_top_k_masking(
     cfg: Config,
 ):
     """Classify images with top-k feature masking."""
-    num_batches = (len(class_data) + batch_size - 1) // batch_size
+    num_batches = (len(class_indices) + batch_size - 1) // batch_size
 
     preds_dict = defaultdict(list)
+    loaded_cls_sae_idx = cls_sae_cnt[cls_idx].argsort()[::-1]
 
     for batch_idx in range(num_batches):
         batch_start = batch_idx * batch_size
-        batch_end = min((batch_idx + 1) * batch_size, len(class_data))
-        batch_data = class_data[batch_start:batch_end]
-
-        batch_inputs = process_batch(vit, batch_data, device)
+        batch_end = min((batch_idx + 1) * batch_size, len(class_indices))
+        batch_sample_indices = class_indices[batch_start:batch_end]
+        batch_dict = dataset[batch_sample_indices]
+        batch_inputs = process_model_inputs(batch_dict, vit, device)
 
         # Get predictions without SAE
         preds_dict["no_sae"].extend(
             get_predictions(vit, batch_inputs, text_features, vit_type)
         )
         torch.cuda.empty_cache()
-
-        # Get top features for current class
-        loaded_cls_sae_idx = cls_sae_cnt[cls_idx].argsort()[::-1]
 
         for topk in TOPK_LIST:
             cls_features = loaded_cls_sae_idx[:topk].tolist()
@@ -187,8 +207,10 @@ def main(
         root_dir, save_name, sae_path, save_suffix, dataset_name
     )
 
-    classnames, data_by_class = load_and_organize_dataset(dataset_name)
-    classnames, data_by_class = filter_data_by_split(classnames, data_by_class, split)
+    dataset = load_dataset(**DATASET_INFO[dataset_name])
+    classnames_all = get_classnames(dataset_name, dataset)
+    classnames, selected_class_indices = split_classnames(classnames_all, split)
+    class_to_indices = build_class_to_indices(dataset, selected_class_indices)
 
     sae, vit, cfg = get_sae_and_vit(
         sae_path,
@@ -216,7 +238,8 @@ def main(
     metrics_dict = {}
     for class_idx, classname in enumerate(tqdm(classnames)):
         preds_dict = classify_with_top_k_masking(
-            data_by_class[classname],
+            dataset,
+            class_to_indices[class_idx],
             class_idx,
             sae,
             vit,
@@ -230,7 +253,9 @@ def main(
 
         metrics_dict[class_idx] = {}
         for k, v in preds_dict.items():
-            metrics_dict[class_idx][k] = v.count(class_idx) / len(v) * 100
+            metrics_dict[class_idx][k] = (
+                v.count(class_idx) / len(v) * 100 if len(v) > 0 else 0.0
+            )
 
     metrics_df = pd.DataFrame(metrics_dict)
     metrics_df.to_csv(f"{save_directory}/metrics.csv", index=False)
