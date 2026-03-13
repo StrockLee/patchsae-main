@@ -1,104 +1,99 @@
 import argparse
 import os
-from typing import Dict
 
 import numpy as np
 import torch
+from datasets import load_dataset
 from tqdm import tqdm
 
-from src.sae_training.config import Config
-from src.sae_training.hooked_vit import HookedVisionTransformer
 from src.sae_training.sparse_autoencoder import SparseAutoencoder
-from src.sae_training.utils import get_model_activations
+from src.sae_training.utils import get_model_activations, process_model_inputs
 from tasks.utils import (
+    DATASET_INFO,
     SAE_DIM,
-    filter_data_by_split,
+    get_classnames,
     get_sae_and_vit,
-    load_and_organize_dataset,
-    process_batch,
     setup_save_directory,
+    split_classnames,
 )
 
 
-def get_sae_activations(
+def get_sae_activations_per_sample(
     model_activations: torch.Tensor, sae: SparseAutoencoder, threshold: float
 ) -> torch.Tensor:
-    """Get binary SAE activations above threshold.
+    """Return per-sample SAE active-feature counts.
 
-    Args:
-        model_activations: Input activations from vision transformer
-        sae: The sparse autoencoder model
-        threshold: Activation threshold
-
-    Returns:
-        Binary tensor indicating which features were active
+    Output shape is [batch, d_sae], where each value is the number of active tokens
+    for that feature in the sample (or 0/1 for class-token SAE).
     """
     _, cache = sae.run_with_cache(model_activations)
     activations = cache["hook_hidden_post"] > threshold
-    return activations.sum(dim=0).sum(dim=0)
+
+    if activations.ndim == 3:
+        # [batch, token, d_sae] -> [batch, d_sae]
+        return activations.sum(dim=1)
+    if activations.ndim == 2:
+        # [batch, d_sae]
+        return activations
+
+    raise ValueError(f"Unexpected SAE activation shape: {tuple(activations.shape)}")
 
 
-def process_class_batch(
-    batch_data: list,
+def compute_all_class_activations_streaming(
+    dataset,
+    class_index_map: dict[int, int],
     sae: SparseAutoencoder,
-    vit: HookedVisionTransformer,
-    cfg: Config,
-    threshold: float,
-    device: str,
-) -> np.ndarray:
-    """Process a single batch of class data and get SAE feature activations."""
-    batch_inputs = process_batch(vit, batch_data, device)
-    transformer_activations = get_model_activations(
-        vit, batch_inputs, cfg.block_layer, cfg.module_name, cfg.class_token
-    )
-    active_features = get_sae_activations(transformer_activations, sae, threshold)
-    return active_features.cpu().numpy()
-
-
-def compute_class_feature_counts(
-    class_data: list,
-    sae: SparseAutoencoder,
-    vit: HookedVisionTransformer,
-    cfg: Config,
+    vit,
+    cfg,
     batch_size: int,
     threshold: float,
     device: str,
 ) -> np.ndarray:
-    """Compute SAE feature activation counts for a single class."""
-    feature_counts = np.zeros(SAE_DIM)
-    num_batches = (len(class_data) + batch_size - 1) // batch_size
+    """Compute class-wise SAE activation counts in one dataset pass.
 
-    for batch_idx in range(num_batches):
-        batch_start = batch_idx * batch_size
-        batch_end = min((batch_idx + 1) * batch_size, len(class_data))
-        batch_data = class_data[batch_start:batch_end]
+    This avoids loading the entire dataset into Python lists by class.
+    """
+    class_activation_counts = np.zeros((len(class_index_map), SAE_DIM), dtype=np.float32)
+    total_iterations = (len(dataset) + batch_size - 1) // batch_size
 
-        batch_counts = process_class_batch(batch_data, sae, vit, cfg, threshold, device)
-        feature_counts += batch_counts
-        torch.cuda.empty_cache()
+    for iteration in tqdm(range(total_iterations)):
+        batch_start = iteration * batch_size
+        batch_end = min((iteration + 1) * batch_size, len(dataset))
+        batch_dict = dataset[batch_start:batch_end]
 
-    return feature_counts
-
-
-def compute_all_class_activations(
-    classnames: list,
-    data_by_class: Dict,
-    sae: SparseAutoencoder,
-    vit: HookedVisionTransformer,
-    cfg: Config,
-    batch_size: int,
-    threshold: float,
-    device: str,
-) -> np.ndarray:
-    """Compute SAE activation counts across all classes."""
-    class_activation_counts = np.zeros((len(classnames), SAE_DIM))
-
-    for class_idx, classname in enumerate(tqdm(classnames)):
-        class_data = data_by_class[classname]
-        class_counts = compute_class_feature_counts(
-            class_data, sae, vit, cfg, batch_size, threshold, device
+        labels = np.asarray(batch_dict["label"], dtype=np.int64)
+        mapped_labels = np.asarray(
+            [class_index_map.get(int(label), -1) for label in labels], dtype=np.int64
         )
-        class_activation_counts[class_idx] = class_counts
+        keep_mask = mapped_labels >= 0
+
+        if not keep_mask.any():
+            continue
+
+        if keep_mask.all():
+            filtered_batch = batch_dict
+        else:
+            keep_indices = np.nonzero(keep_mask)[0].tolist()
+            filtered_batch = {
+                key: [batch_dict[key][index] for index in keep_indices]
+                for key in batch_dict
+            }
+            mapped_labels = mapped_labels[keep_mask]
+
+        batch_inputs = process_model_inputs(filtered_batch, vit, device)
+        transformer_activations = get_model_activations(
+            vit, batch_inputs, cfg.block_layer, cfg.module_name, cfg.class_token
+        )
+        active_features = (
+            get_sae_activations_per_sample(transformer_activations, sae, threshold)
+            .to(torch.float32)
+            .cpu()
+            .numpy()
+        )
+
+        np.add.at(class_activation_counts, mapped_labels, active_features)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return class_activation_counts
 
@@ -124,8 +119,13 @@ def main(
         root_dir, save_name, sae_path, split_suffix, dataset_name
     )
 
-    classnames, data_by_class = load_and_organize_dataset(dataset_name)
-    classnames, data_by_class = filter_data_by_split(classnames, data_by_class, split)
+    dataset = load_dataset(**DATASET_INFO[dataset_name])
+    classnames_all = get_classnames(dataset_name, dataset)
+    classnames, selected_class_indices = split_classnames(classnames_all, split)
+    class_index_map = {
+        int(class_index): local_index
+        for local_index, class_index in enumerate(selected_class_indices)
+    }
 
     sae, vit, cfg = get_sae_and_vit(
         sae_path,
@@ -137,8 +137,8 @@ def main(
         classnames=classnames,
     )
 
-    class_activation_counts = compute_all_class_activations(
-        classnames, data_by_class, sae, vit, cfg, batch_size, threshold, device
+    class_activation_counts = compute_all_class_activations_streaming(
+        dataset, class_index_map, sae, vit, cfg, batch_size, threshold, device
     )
 
     # Save results
