@@ -31,10 +31,10 @@ def get_sae_activations_per_sample(
 
     if activations.ndim == 3:
         # [batch, token, d_sae] -> [batch, d_sae]
-        return activations.sum(dim=1)
+        return activations.sum(dim=1).to(torch.int64)
     if activations.ndim == 2:
         # [batch, d_sae]
-        return activations
+        return activations.to(torch.int64)
 
     raise ValueError(f"Unexpected SAE activation shape: {tuple(activations.shape)}")
 
@@ -53,7 +53,7 @@ def compute_all_class_activations_streaming(
 
     This avoids loading the entire dataset into Python lists by class.
     """
-    class_activation_counts = np.zeros((len(class_index_map), SAE_DIM), dtype=np.float32)
+    class_activation_counts = np.zeros((len(class_index_map), SAE_DIM), dtype=np.int64)
     total_iterations = (len(dataset) + batch_size - 1) // batch_size
 
     for iteration in tqdm(range(total_iterations)):
@@ -86,7 +86,7 @@ def compute_all_class_activations_streaming(
         )
         active_features = (
             get_sae_activations_per_sample(transformer_activations, sae, threshold)
-            .to(torch.float32)
+            .to(torch.int64)
             .cpu()
             .numpy()
         )
