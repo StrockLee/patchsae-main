@@ -26,14 +26,19 @@ def get_sae_activations_per_sample(
     Output shape is [batch, d_sae], where each value is the number of active tokens
     for that feature in the sample (or 0/1 for class-token SAE).
     """
+    # run_with_cache captures internal SAE activations without modifying behavior.
     _, cache = sae.run_with_cache(model_activations)
+    # Binary active mask for each latent (thresholded activation).
+    # threshold=0.2 means "activation > 0.2 counts as active".
     activations = cache["hook_hidden_post"] > threshold
 
     if activations.ndim == 3:
         # [batch, token, d_sae] -> [batch, d_sae]
+        # Count active tokens per latent for each sample.
         return activations.sum(dim=1).to(torch.int64)
     if activations.ndim == 2:
         # [batch, d_sae]
+        # Class-token SAE path: activation already per sample per latent.
         return activations.to(torch.int64)
 
     raise ValueError(f"Unexpected SAE activation shape: {tuple(activations.shape)}")
@@ -53,27 +58,34 @@ def compute_all_class_activations_streaming(
 
     This avoids loading the entire dataset into Python lists by class.
     """
+    # Rows = classes, cols = SAE latent dimensions.
+    # Value = accumulated activation counts from all samples in that class.
     class_activation_counts = np.zeros((len(class_index_map), SAE_DIM), dtype=np.int64)
     total_iterations = (len(dataset) + batch_size - 1) // batch_size
 
     for iteration in tqdm(range(total_iterations)):
+        # Slice one batch directly from Hugging Face dataset.
         batch_start = iteration * batch_size
         batch_end = min((iteration + 1) * batch_size, len(dataset))
         batch_dict = dataset[batch_start:batch_end]
 
+        # Map original dataset labels -> local split labels.
         labels = np.asarray(batch_dict["label"], dtype=np.int64)
         mapped_labels = np.asarray(
             [class_index_map.get(int(label), -1) for label in labels], dtype=np.int64
         )
         keep_mask = mapped_labels >= 0
 
+        # If this batch has no class from current split, skip.
         if not keep_mask.any():
             continue
 
+        # Keep only samples that belong to selected class split.
         if keep_mask.all():
             filtered_batch = batch_dict
         else:
             keep_indices = np.nonzero(keep_mask)[0].tolist()
+            # Rebuild the dict-of-lists batch with only selected rows.
             filtered_batch = {
                 key: [batch_dict[key][index] for index in keep_indices]
                 for key in batch_dict
@@ -91,8 +103,11 @@ def compute_all_class_activations_streaming(
             .numpy()
         )
 
+        # Add each sample's latent counts to its class row.
+        # np.add.at supports repeated indices and performs safe in-place accumulation.
         np.add.at(class_activation_counts, mapped_labels, active_features)
         if torch.cuda.is_available():
+            # This helps low-memory GPUs but can reduce throughput on strong GPUs.
             torch.cuda.empty_cache()
 
     return class_activation_counts
@@ -114,6 +129,7 @@ def main(
 ):
     """Main function to compute and save class-wise SAE activation counts."""
 
+    # Include split in output folder to avoid accidental overwrite.
     split_suffix = vit_type if split == "all" else f"{vit_type}_{split}"
     save_directory = setup_save_directory(
         root_dir, save_name, sae_path, split_suffix, dataset_name
@@ -122,6 +138,8 @@ def main(
     dataset = load_dataset(**DATASET_INFO[dataset_name])
     classnames_all = get_classnames(dataset_name, dataset)
     classnames, selected_class_indices = split_classnames(classnames_all, split)
+    # Original class index -> local row index in output matrix.
+    # Example: if split="novel", local row 0 may correspond to original class 500.
     class_index_map = {
         int(class_index): local_index
         for local_index, class_index in enumerate(selected_class_indices)
@@ -141,7 +159,7 @@ def main(
         dataset, class_index_map, sae, vit, cfg, batch_size, threshold, device
     )
 
-    # Save results
+    # Save results as [num_selected_classes, SAE_DIM].
     save_path = os.path.join(save_directory, "cls_sae_cnt.npy")
     np.save(save_path, class_activation_counts)
     print(f"Class activation counts saved at {save_directory}")

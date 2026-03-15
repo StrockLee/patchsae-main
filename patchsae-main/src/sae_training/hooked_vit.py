@@ -18,6 +18,7 @@ from transformers import CLIPModel
 # 1 - residual stream post transformer block.
 # 2 - mlp activations.
 # More hooks can be added at a later date, but only post-module.
+# In this repository, we mainly use "resid" hooks for SAE-based interventions.
 class Hook:
     def __init__(
         self,
@@ -28,21 +29,26 @@ class Hook:
         return_module_output=True,
     ):
         self.path_dict = {
+            # Empty suffix means hook module output of the full transformer block.
             "resid": "",
         }
         assert module_name in self.path_dict.keys(), (
             f"Module name '{module_name}' not recognised."
         )
         self.return_module_output = return_module_output
+        # The adapter wraps user hook_fn into the signature expected by PyTorch hooks.
         self.function = self.get_full_hook_fn(hook_fn)
         self.attr_path = self.get_attr_path(block_layer, module_name, is_custom)
 
     def get_full_hook_fn(self, hook_fn: Callable):
         def full_hook_fn(module, module_input, module_output):
+            # For CLIP blocks, output is typically a tuple where index 0 is tensor.
             hook_fn_output = hook_fn(module_output[0])
             if self.return_module_output:
+                # Keep original module output unchanged.
                 return module_output
             else:
+                # Replace module output with hooked tensor.
                 return hook_fn_output  # Inexplicably, the module output is not a tensor of activaitons but a tuple (tensor,)...??
 
         return full_hook_fn
@@ -50,6 +56,7 @@ class Hook:
     def get_attr_path(
         self, block_layer: int, module_name: str, is_custom: bool = None
     ) -> str:
+        # CLIP path vs MaPLe-custom path differ in module nesting.
         if is_custom:
             attr_path = f"image_encoder.transformer.resblocks[{block_layer}]"
         else:
@@ -58,6 +65,7 @@ class Hook:
         return attr_path
 
     def get_module(self, model):
+        # Resolve a string path like "vision_model.encoder.layers[11]".
         return self.get_nested_attr(model, self.attr_path)
 
     def get_nested_attr(self, model, attr_path):
@@ -78,6 +86,9 @@ class Hook:
 
 class HookedVisionTransformer:
     def __init__(self, model, processor, device="cuda"):
+        # Keep model and processor together for convenience in task scripts.
+        # - model: CLIP or adapted CLIP-like model
+        # - processor: tokenizer + image preprocessor bundle
         self.model = model.to(device)
         self.processor = processor
 
@@ -88,12 +99,14 @@ class HookedVisionTransformer:
         return_type="output",
         **kwargs,
     ):
+        # Build runtime hooks, run one forward pass, and return cached activations.
         cache_dict, list_of_hooks = self.get_caching_hooks(list_of_hook_locations)
         with self.hooks(list_of_hooks) as hooked_model:
             with torch.no_grad():
                 output = hooked_model(*args, **kwargs)
 
         if return_type == "output":
+            # Return model output object + activations captured by hooks.
             return output, cache_dict
         if return_type == "loss":
             return (
@@ -113,6 +126,7 @@ class HookedVisionTransformer:
         list_of_hooks = []
 
         def save_activations(name, activations):
+            # Detach to avoid keeping computation graph in memory.
             cache_dict[name] = activations.detach()
 
         for block_layer, module_name in list_of_hook_locations:
@@ -121,6 +135,7 @@ class HookedVisionTransformer:
                 is_custom = False
             else:
                 is_custom = True
+            # "is_custom" controls how module path is resolved (CLIP vs MaPLe style).
             hook = Hook(block_layer, module_name, hook_fn, is_custom=is_custom)
             list_of_hooks.append(hook)
         return cache_dict, list_of_hooks
@@ -129,6 +144,7 @@ class HookedVisionTransformer:
     def run_with_hooks(
         self, list_of_hooks: List[Hook], *args, return_type="output", **kwargs
     ):
+        # Run a forward pass with user-provided hooks (no cache returned).
         with self.hooks(list_of_hooks) as hooked_model:
             with torch.no_grad():
                 output = hooked_model(*args, **kwargs)
@@ -146,6 +162,7 @@ class HookedVisionTransformer:
     def train_with_hooks(
         self, list_of_hooks: List[Hook], *args, return_type="output", **kwargs
     ):
+        # Same as run_with_hooks, but without no_grad for training use-cases.
         with self.hooks(list_of_hooks) as hooked_model:
             output = hooked_model(*args, **kwargs)
         if return_type == "output":
@@ -164,6 +181,7 @@ class HookedVisionTransformer:
         logits_per_image: Float[Tensor, "n_images n_prompts"],  # noqa: F722
         logits_per_text: Float[Tensor, "n_prompts n_images"],  # noqa: F722
     ):  # Assumes square matrices
+        # Standard CLIP contrastive objective over image-text similarity matrix.
         assert logits_per_image.size()[0] == logits_per_image.size()[1], (
             "The number of prompts does not match the number of images."
         )
@@ -198,8 +216,11 @@ class HookedVisionTransformer:
                 module = hook.get_module(self.model)
                 handle = module.register_forward_hook(hook.function)
                 hook_handles.append(handle)
+            # Return control to caller while hooks are active.
             yield self.model
         finally:
+            # Always clean up hooks, even when an exception is raised.
+            # Without this, hooks would accumulate and corrupt later runs.
             for handle in hook_handles:
                 handle.remove()
 
@@ -210,6 +231,7 @@ class HookedVisionTransformer:
         return self.forward(*args, return_type=return_type, **kwargs)
 
     def forward(self, *args, return_type="output", **kwargs):
+        # Thin wrapper so callers can ask for model output or computed loss.
         if return_type == "output":
             return self.model(*args, **kwargs)
         elif return_type == "loss":

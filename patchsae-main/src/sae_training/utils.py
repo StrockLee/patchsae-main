@@ -14,12 +14,19 @@ def process_model_inputs(
     batch: Dict, vit: HookedVisionTransformer, device: str, process_labels: bool = False
 ) -> torch.Tensor:
     """Process input images through the ViT processor."""
+    # When process_labels=True, build class prompts from labels.
+    # This mode is mainly for tasks that need image-text paired inputs.
     if process_labels:
         labels = [f"A photo of a {label}" for label in batch["label"]]
         return vit.processor(
             images=batch["image"], text=labels, return_tensors="pt", padding=True
         ).to(device)
 
+    # Default mode: image-only workload, while still passing a dummy text field
+    # to keep CLIP processor output format consistent with model forward.
+    # Returned object typically contains:
+    # - pixel_values: [batch, 3, H, W]
+    # - input_ids / attention_mask for text branch (can be minimal here)
     return vit.processor(
         images=batch["image"], text="", return_tensors="pt", padding=True
     ).to(device)
@@ -31,37 +38,46 @@ def get_model_activations(
     """Extract activations from a specific layer of the vision transformer model."""
     hook_location = (block_layer, module_name)
 
-    # Run model forward pass and extract activations from cache
+    # Register one hook target and run a single forward pass.
+    # Returned cache key is (block_layer, module_name).
     _, cache = model.run_with_cache([hook_location], **inputs)
     activations = cache[hook_location]
 
+    # Different backbones may output [seq, batch, dim] or [batch, seq, dim].
+    # Normalize to [batch, seq, dim] for downstream SAE code.
     batch_size = inputs["pixel_values"].shape[0]
     if activations.shape[0] != batch_size:
         activations = activations.transpose(0, 1)
 
-    # Extract class token if specified
+    # If class_token mode is enabled, keep only CLS token activations:
+    # [batch, seq, dim] -> [batch, dim]
+    # This reduces memory and focuses on global image representation.
     if class_token:
-        activations = activations[0, :, :]
+        activations = activations[:, 0, :]
 
     return activations
 
 
 def get_scheduler(scheduler_name: Optional[str], optimizer: optim.Optimizer, **kwargs):
+    # Linear warmup then linear decay to 0.
     def get_warmup_lambda(warm_up_steps, training_steps):
         def lr_lambda(steps):
+            # Warmup phase: increase LR from near 0 to base LR.
             if steps < warm_up_steps:
                 return (steps + 1) / warm_up_steps
             else:
+                # Decay phase: linearly reduce to 0 at final step.
                 return (training_steps - steps) / (training_steps - warm_up_steps)
 
         return lr_lambda
 
-    # heavily derived from hugging face although copilot helped.
+    # Linear warmup then cosine decay to lr_end.
     def get_warmup_cosine_lambda(warm_up_steps, training_steps, lr_end):
         def lr_lambda(steps):
             if steps < warm_up_steps:
                 return (steps + 1) / warm_up_steps
             else:
+                # progress in [0, 1], then cosine interpolation to lr_end.
                 progress = (steps - warm_up_steps) / (training_steps - warm_up_steps)
                 return lr_end + 0.5 * (1 - lr_end) * (1 + math.cos(math.pi * progress))
 
@@ -96,6 +112,8 @@ def get_scheduler(scheduler_name: Optional[str], optimizer: optim.Optimizer, **k
         training_steps = kwargs.get("training_steps")
         eta_min = kwargs.get("lr_end", 0)
         num_cycles = kwargs.get("num_cycles", 1)
+        # One restart period length.
+        # Example: training_steps=10000, num_cycles=2 => restart every 5000 steps.
         T_0 = training_steps // num_cycles
         return lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, T_0=T_0, eta_min=eta_min

@@ -22,17 +22,27 @@ from tasks.utils import (
     split_classnames,
 )
 
+# Top-k latent sets used in the paper-style masking ablation.
+# For each k, this script runs both:
+#   - on_k: keep only the class-selected top-k SAE latents
+#   - off_k: suppress exactly those top-k latents
+# plus one baseline "no_sae" run.
+# The final value `SAE_DIM` means "use all SAE latents".
 TOPK_LIST = [1, 2, 5, 10, 50, 100, 500, 1000, 2000, SAE_DIM]
 SAE_BIAS = -0.105131256516992
 
 
 def calculate_text_features(model, device, classnames):
     """Calculate mean text features across templates for each class."""
+    # We average CLIP text embeddings over multiple prompt templates
+    # (e.g., "a photo of a {class}") to reduce prompt sensitivity.
+    # Start from scalar 0; after first addition this becomes a tensor accumulator.
     mean_text_features = 0
 
     for template_fn in openai_imagenet_template:
         # Generate prompts and convert to token IDs
         prompts = [template_fn(c) for c in classnames]
+        # CLIP tokenizer returns variable-length token IDs per prompt.
         prompt_ids = [
             model.processor(
                 text=p, return_tensors="pt", padding=False, truncation=True
@@ -46,24 +56,32 @@ def calculate_text_features(model, device, classnames):
         # Get text features
         with torch.no_grad():
             text_features = model.model.get_text_features(padded_prompts)
+            # Normalize so cosine similarity can be computed by dot product.
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
             mean_text_features += text_features
 
+    # Final class text bank: [num_classes, embed_dim]
     return mean_text_features / len(openai_imagenet_template)
 
 
 def create_sae_hooks(vit_type, cfg, cls_features, sae, device, hook_type="on"):
     """Create SAE hooks based on model type and hook type."""
     # Setup clamping parameters
+    # True for all latent dims (we clamp on full SAE latent space, then
+    # selectively keep/suppress class-specific dims via clamp_value).
     clamp_feat_dim = torch.ones(SAE_DIM).bool()
     clamp_value = torch.zeros(SAE_DIM) if hook_type == "on" else torch.ones(SAE_DIM)
     clamp_value = clamp_value.to(device)
+    # on: selected dims -> 1, others -> 0
+    # off: selected dims -> 0, others -> 1
     clamp_value[cls_features] = 1.0 if hook_type == "on" else 0.0
 
     def process_activations(activations, is_maple=False):
         """Helper function to process activations with SAE"""
+        # MaPLe hooks use a different tensor layout, so we transpose when needed.
         act = activations.transpose(0, 1) if is_maple else activations
         processed = (
+            # forward_clamp returns a tuple; index 0 is reconstructed activations.
             sae.forward_clamp(
                 act[:, :, :], clamp_feat_dim=clamp_feat_dim, clamp_value=clamp_value
             )[0]
@@ -72,10 +90,12 @@ def create_sae_hooks(vit_type, cfg, cls_features, sae, device, hook_type="on"):
         return processed
 
     def hook_fn_default(activations):
+        # In-place replacement of block activations for CLIP/base model.
         activations[:, :, :] = process_activations(activations)
         return (activations,)
 
     def hook_fn_maple(activations):
+        # MaPLe expects transposed output shape.
         activations = process_activations(activations, is_maple=True)
         return activations.transpose(0, 1)
 
@@ -97,13 +117,17 @@ def create_sae_hooks(vit_type, cfg, cls_features, sae, device, hook_type="on"):
 def get_predictions(vit, inputs, text_features, vit_type, hooks=None):
     """Get model predictions with optional hooks."""
     with torch.no_grad():
+        # Either run original model (no hooks) or patched model (with SAE hook).
         if hooks:
             vit_out = vit.run_with_hooks(hooks, return_type="output", **inputs)
         else:
             vit_out = vit(return_type="output", **inputs)
 
+        # base: CLIPModel output object -> use image_embeds
+        # maple: code path already returns image features tensor
         image_features = vit_out.image_embeds if vit_type == "base" else vit_out
         logit_scale = vit.model.logit_scale.exp()
+        # Since text features are normalized, this is scaled cosine logits.
         logits = logit_scale * image_features @ text_features.t()
         preds = logits.argmax(dim=-1)
 
@@ -112,6 +136,8 @@ def get_predictions(vit, inputs, text_features, vit_type, hooks=None):
 
 def build_class_to_indices(dataset, selected_class_indices: list[int]) -> list[list[int]]:
     """Build class -> sample-index mapping without storing full image objects."""
+    # Memory-efficient indexing:
+    # keep only integer indices per class, avoid storing PIL images in RAM.
     class_to_indices = [[] for _ in range(len(selected_class_indices))]
     original_to_local = {
         int(original_class_idx): local_idx
@@ -145,10 +171,15 @@ def classify_with_top_k_masking(
     show_inner_progress: bool = False,
 ):
     """Classify images with top-k feature masking."""
+    # Inner progress length is number of batches for THIS class.
     num_batches = (len(class_indices) + batch_size - 1) // batch_size
 
     preds_dict = defaultdict(list)
+    # Pre-sort SAE latent importances for this class once.
     loaded_cls_sae_idx = cls_sae_cnt[cls_idx].argsort()[::-1]
+    # Cost note:
+    # per batch we run 1 baseline + (2 * len(TOPK_LIST)) hooked forward passes.
+    # This is why this stage is much slower than plain CLIP inference.
 
     batch_iter = range(num_batches)
     if show_inner_progress:
@@ -163,15 +194,17 @@ def classify_with_top_k_masking(
         batch_start = batch_idx * batch_size
         batch_end = min((batch_idx + 1) * batch_size, len(class_indices))
         batch_sample_indices = class_indices[batch_start:batch_end]
+        # Hugging Face dataset supports list-based indexing and returns dict-of-lists.
         batch_dict = dataset[batch_sample_indices]
         batch_inputs = process_model_inputs(batch_dict, vit, device)
 
-        # Get predictions without SAE
+        # 1) Baseline prediction without intervention.
         preds_dict["no_sae"].extend(
             get_predictions(vit, batch_inputs, text_features, vit_type)
         )
         torch.cuda.empty_cache()
 
+        # 2) For each k, run on/off interventions.
         for topk in TOPK_LIST:
             cls_features = loaded_cls_sae_idx[:topk].tolist()
 
@@ -209,6 +242,7 @@ def main(
     split: str = "all",
     show_inner_progress: bool = False,
 ):
+    # Save suffix indicates which cls-wise activation source and split are used.
     class_feature_type = cls_wise_sae_activation_path.split("/")[-3]
     save_suffix = (
         f"{class_feature_type}_{vit_type}"
@@ -222,6 +256,8 @@ def main(
     dataset = load_dataset(**DATASET_INFO[dataset_name])
     classnames_all = get_classnames(dataset_name, dataset)
     classnames, selected_class_indices = split_classnames(classnames_all, split)
+    # Build class -> index list once; later batches fetch by index slices.
+    # This avoids holding full sample dicts in memory for each class.
     class_to_indices = build_class_to_indices(dataset, selected_class_indices)
 
     sae, vit, cfg = get_sae_and_vit(
@@ -243,12 +279,16 @@ def main(
         )
 
     if vit_type == "base":
+        # CLIP baseline: derive text prototypes from prompt templates.
         text_features = calculate_text_features(vit, device, classnames)
     else:
+        # MaPLe path already stores/serves text features in model object.
         text_features = vit.model.get_text_features()
 
     metrics_dict = {}
     for class_idx, classname in enumerate(tqdm(classnames)):
+        # For each class, evaluate all intervention settings and collect predictions.
+        # NOTE: class_idx here is local index within selected split.
         preds_dict = classify_with_top_k_masking(
             dataset,
             class_to_indices[class_idx],
@@ -267,6 +307,7 @@ def main(
 
         metrics_dict[class_idx] = {}
         for k, v in preds_dict.items():
+            # Per-class top-1 accuracy (%), where "correct" means predicting class_idx.
             metrics_dict[class_idx][k] = (
                 v.count(class_idx) / len(v) * 100 if len(v) > 0 else 0.0
             )

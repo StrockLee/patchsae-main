@@ -12,7 +12,10 @@ from src.sae_training.config import Config
 from src.sae_training.hooked_vit import HookedVisionTransformer
 from src.sae_training.sparse_autoencoder import SparseAutoencoder
 
-# Dataset configurations
+# Dataset registry used by task scripts.
+# Note:
+# - `imagenet` here points to `train` split of the resized HF version.
+# - Changing split/path here will affect ALL tasks that import DATASET_INFO.
 DATASET_INFO = {
     "imagenet": {
         "path": "evanarlian/imagenet_1k_resized_256",
@@ -38,12 +41,18 @@ SAE_DIM = 49152
 
 def load_sae(sae_path: str, device: str) -> tuple[SparseAutoencoder, Config]:
     """Load a sparse autoencoder model from a checkpoint file."""
+    # Always load checkpoint to CPU first, then move model to target device.
+    # This is safer and avoids OOM during deserialization.
     checkpoint = torch.load(sae_path, map_location="cpu")
 
+    # Backward compatibility: some checkpoints use "cfg", others "config".
     if "cfg" in checkpoint:
         cfg = Config(checkpoint["cfg"])
     else:
         cfg = Config(checkpoint["config"])
+
+    # Build SAE from config and restore trained weights.
+    # `cfg` defines SAE width, hook location, and training hyperparameters.
     sae = SparseAutoencoder(cfg, device)
     sae.load_state_dict(checkpoint["state_dict"])
     sae.eval().to(device)
@@ -61,6 +70,8 @@ def load_hooked_vit(
     classnames: list[str] = None,
 ) -> HookedVisionTransformer:
     """Load a vision transformer model with hooks."""
+    # base -> original CLIP
+    # maple -> adapted CLIP (prompt-learning style)
     if vit_type == "base":
         model, processor = get_base_clip(backbone)
     else:
@@ -68,6 +79,7 @@ def load_hooked_vit(
             cfg, vit_type, model_path, config_path, backbone, classnames
         )
 
+    # Wrap model with hook-friendly helper.
     return HookedVisionTransformer(model, processor, device=device)
 
 
@@ -81,6 +93,8 @@ def get_sae_and_vit(
     classnames: list[str] = None,
 ) -> tuple[SparseAutoencoder, HookedVisionTransformer, Config]:
     """Load both SAE and ViT models."""
+    # Shared utility used by most task scripts to keep model loading consistent.
+    # This prevents subtle mismatch (e.g., wrong backbone or wrong hook layer).
     sae, cfg = load_sae(sae_path, device)
     vit = load_hooked_vit(
         cfg, vit_type, backbone, device, model_path, config_path, classnames
@@ -98,9 +112,12 @@ def load_and_organize_dataset(dataset_name: str) -> Tuple[list, Dict]:
     dataset = load_dataset(**DATASET_INFO[dataset_name])
     classnames = get_classnames(dataset_name, dataset)
 
+    # Build classname -> list[sample] dictionary.
+    # This is easy to use but memory-heavy on large datasets.
     data_by_class = defaultdict(list)
     for data_item in tqdm(dataset):
         classname = classnames[data_item["label"]]
+        # Each value is a full sample dict from Hugging Face dataset.
         data_by_class[classname].append(data_item)
 
     return classnames, data_by_class
@@ -118,6 +135,7 @@ def split_classnames(classnames: list[str], split: str) -> tuple[list[str], list
     if split == "all":
         indices = list(range(len(classnames)))
     else:
+        # Paper convention: first half "base", second half "novel".
         midpoint = len(classnames) // 2
         if split == "base":
             indices = list(range(midpoint))
@@ -142,6 +160,8 @@ def get_classnames(
 ) -> list[str]:
     """Get class names for a dataset."""
 
+    # Classname files are stored in configs/classnames.
+    # Supports either txt or json depending on dataset.
     filename = f"{data_root}/{dataset_name}_classnames"
     txt_filename = filename + ".txt"
     json_filename = filename + ".json"
@@ -153,12 +173,15 @@ def get_classnames(
 
     with open(filename, "r") as file:
         if dataset_name == "caltech101":
+            # Caltech file already stores plain class names per line.
             class_names = [line.strip() for line in file.readlines()]
         elif dataset_name == "imagenet" or dataset_name == "imagenet-sketch":
+            # ImageNet file format usually begins with synset id; drop it.
             class_names = [
                 " ".join(line.strip().split(" ")[1:]) for line in file.readlines()
             ]
         elif dataset_name == "oxford_flowers":
+            # Oxford flowers classnames file is keyed by HF class names.
             assert dataset is not None, "Dataset must be provided for Oxford Flowers"
             new_class_dict = {}
             class_names = json.load(file)
@@ -182,14 +205,20 @@ def setup_save_directory(
             "sae_path is empty. Please pass a valid checkpoint path to --sae_path."
         )
 
+    # Normalize separators for Windows/Linux compatibility.
     normalized_path = str(sae_path).replace("\\", "/")
     path_parts = [part for part in normalized_path.split("/") if part]
 
+    # Usually use parent folder as run name; fallback to filename stem.
+    # Example:
+    # sae_path=/.../final_sparse_autoencoder_openai/clip-vit...pt
+    # sae_run_name becomes "final_sparse_autoencoder_openai"
     if len(path_parts) >= 2:
         sae_run_name = path_parts[-2]
     else:
         sae_run_name = os.path.splitext(path_parts[-1])[0]
 
+    # Canonical output layout used by all downstream scripts.
     save_directory = (
         f"{root_dir}/{save_name}/sae_{sae_run_name}/{vit_type}/{dataset_name}"
     )
@@ -203,12 +232,13 @@ def get_sae_activations(
     """Extract and process activations from the sparse autoencoder."""
     hook_name = "hook_hidden_post"
 
-    # Run SAE forward pass and get activations from cache
+    # Run SAE forward pass and get hidden-post activations from hook cache.
     _, cache = sae.run_with_cache(model_activations)
     sae_activations = cache[hook_name]
 
-    # Average across sequence length dimension if needed
+    # If token dimension exists, average over tokens to get per-image activation.
     if len(sae_activations.size()) > 2:
+        # [batch, seq, d_sae] -> [batch, d_sae]
         sae_activations = sae_activations.mean(dim=1)
 
     return sae_activations
@@ -216,8 +246,10 @@ def get_sae_activations(
 
 def process_batch(vit, batch_data, device):
     """Process a single batch of images."""
+    # Convert list of sample dicts into processor-ready image list.
     images = [data["image"] for data in batch_data]
 
+    # Keep text field for consistent CLIP input schema.
     inputs = vit.processor(
         images=images, text="", return_tensors="pt", padding=True
     ).to(device)
@@ -241,6 +273,7 @@ def get_max_acts_and_images(
         max_act_imgs[dataset_name] = torch.load(max_act_path, map_location="cpu").to(
             torch.int32
         )
+        # Shape is typically [d_sae, top_n].
 
         # Load mean activations
         mean_acts_path = os.path.join(
@@ -249,12 +282,14 @@ def get_max_acts_and_images(
             "sae_mean_acts.pt",
         )
         mean_acts[dataset_name] = torch.load(mean_acts_path, map_location="cpu").numpy()
+        # Shape is [d_sae], one scalar summary per latent.
 
     return max_act_imgs, mean_acts
 
 
 def load_datasets(include_imagenet: bool = False, seed: int = 1):
     """Load multiple datasets from HuggingFace."""
+    # Used by demo/evaluation helpers; all datasets are shuffled for randomness.
     if include_imagenet:
         return {
             "imagenet": load_dataset(
@@ -288,8 +323,9 @@ def get_all_classnames(datasets, data_root):
     for dataset_name, dataset in datasets.items():
         class_names[dataset_name] = get_classnames(dataset_name, dataset, data_root)
 
-    # imagenet classnames are required to classnames for maple
+    # Keep ImageNet class names available because MaPLe helper may rely on them.
     if "imagenet" not in class_names:
+        # Fallback: load ImageNet names explicitly for methods needing shared label space.
         filename = f"{data_root}/imagenet_classnames"
         txt_filename = filename + ".txt"
         json_filename = filename + ".json"

@@ -17,6 +17,8 @@ from tasks.utils import (
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    # Model/activation extraction options.
+    # class_token=True means only use CLS token activation for SAE training.
     parser.add_argument("--class_token", action="store_true", default=None)
     parser.add_argument("--image_width", type=int, default=224)
     parser.add_argument("--image_height", type=int, default=224)
@@ -34,6 +36,8 @@ if __name__ == "__main__":
     parser.add_argument("--b_dec_init_method", type=str, default="geometric_median")
     parser.add_argument("--gated_sae", action="store_true", default=None)
     # Training Parameters
+    # total_training_tokens controls the total number of image samples
+    # consumed by SAE training loop (not NLP token count).
     parser.add_argument("--lr", type=float, default=0.0004)
     parser.add_argument("--l1_coefficient", type=float, default=0.00008)
     parser.add_argument("--lr_scheduler_name", type=str, default="constantwithwarmup")
@@ -43,6 +47,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_batches_in_store", type=int, default=15)
     parser.add_argument("--mse_cls_coefficient", type=float, default=1.0)
     # Dead Neurons and Sparsity
+    # use_ghost_grads is the stabilization/revival mechanism for dead features.
     parser.add_argument("--use_ghost_grads", action="store_true", default=None)
     parser.add_argument("--feature_sampling_method")
     parser.add_argument("--feature_sampling_window", type=int, default=64)
@@ -58,6 +63,7 @@ if __name__ == "__main__":
         help="Use a small dataset subset for end-to-end NaN debugging.",
     )
     # WANDB
+    # log_to_wandb=False means training still runs; it just logs locally.
     parser.add_argument("--log_to_wandb", action="store_true", default=None)
     parser.add_argument("--wandb_project", type=str, default="patch_sae")
     parser.add_argument("--wandb_entity", type=str, default="test")
@@ -67,7 +73,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_checkpoints", type=int, default=1)
     parser.add_argument("--checkpoint_path", type=str, default="out/checkpoints")
     parser.add_argument("--device", type=str, default="cuda")
-    # resume
+    # Resume-related flags (kept for compatibility with trainer workflows).
     parser.add_argument("--root_dir", type=str, default="")
     parser.add_argument("--resume", action="store_true", default=None)
     parser.add_argument("--run_name", type=str, default="train")
@@ -88,12 +94,14 @@ if __name__ == "__main__":
         help="CLIP config path in the case of using maple",
     )
     args = parser.parse_args()
+    # Normalize model name to expected HF namespace.
     normalized_model_name = (
         args.model_name
         if args.model_name.startswith("openai/")
         else f"openai/{args.model_name}"
     )
 
+    # ViTSAERunnerConfig centralizes all training/runtime options.
     cfg = ViTSAERunnerConfig(
         class_token=args.class_token,
         image_width=args.image_width,
@@ -138,20 +146,26 @@ if __name__ == "__main__":
     )
 
     print("Loading dataset")
+    # Class names are needed for some adapted backbones (e.g., MaPLe).
     classnames = get_classnames(args.dataset)
+    # DATASET_INFO chooses exact Hugging Face dataset path + split.
     dataset = load_dataset(**DATASET_INFO[args.dataset])
     if args.debug_dataset_size and args.debug_dataset_size > 0:
         debug_take_n = min(args.debug_dataset_size, len(dataset))
+        # Deterministic quick-debug mode: take first N samples.
         dataset = dataset.select(range(debug_take_n))
         print(f"Debug subset enabled: using first {debug_take_n} samples.")
 
     if args.debug_numerics:
+        # PyTorch anomaly mode helps pinpoint operation that created NaN/Inf.
         torch.autograd.set_detect_anomaly(True)
         print("Enabled torch.autograd anomaly detection.")
 
     print("Loading SAE and ViT models")
+    # SAE maps ViT activations -> sparse latent features -> reconstruction.
     sae = SparseAutoencoder(cfg, args.device)
 
+    # HookedViT wrapper provides cache/hook APIs used by activation store and trainer.
     vit = load_hooked_vit(
         cfg,
         args.vit_type,
@@ -163,6 +177,7 @@ if __name__ == "__main__":
     )
 
     print("Initializing ViTActivationsStore")
+    # Activation store prefetches ViT hidden states to keep trainer loop simple.
     activation_store = ViTActivationsStore(
         dataset,
         args.batch_size,
@@ -175,15 +190,19 @@ if __name__ == "__main__":
     )
 
     optimizer = torch.optim.Adam(sae.parameters(), lr=sae.cfg.lr)
+    # Scheduler policy comes from cfg (constant/warmup/cosine...).
     scheduler = get_scheduler(args.lr_scheduler_name, optimizer=optimizer)
 
     print("Initializing SAE b_dec using activation_store")
+    # b_dec is decoder bias; initializing from data often improves stability.
     sae.initialize_b_dec(activation_store)
     sae.train()
 
     if cfg.log_to_wandb:
+        # name=cfg.run_name keeps W&B run naming consistent with config.
         wandb.init(project=cfg.wandb_project, config=cfg, name=cfg.run_name)
 
+    # SAETrainer encapsulates train loop, logging, checkpointing, and dead-feature stats.
     sae_trainer = SAETrainer(
         sae, vit, activation_store, cfg, optimizer, scheduler, args.device
     )

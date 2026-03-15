@@ -22,9 +22,17 @@ def initialize_storage_tensors(
     d_sae: int, num_max: int, device: str
 ) -> Dict[str, torch.Tensor]:
     """Initialize tensors for storing results."""
+    # max_activating_image_values/indices:
+    #   For each SAE latent, keep top-N highest activation image IDs.
+    # sae_sparsity:
+    #   Running count of how many samples activate each latent (>0).
+    # sae_mean_acts:
+    #   Running sum of activation values for each latent.
     return {
         "max_activating_image_values": torch.zeros([d_sae, num_max]).to(device),
-        "max_activating_image_indices": torch.zeros([d_sae, num_max]).to(device),
+        "max_activating_image_indices": torch.zeros(
+            [d_sae, num_max], dtype=torch.long, device=device
+        ),
         "sae_sparsity": torch.zeros([d_sae]).to(device),
         "sae_mean_acts": torch.zeros([d_sae]).to(device),
     }
@@ -38,6 +46,10 @@ def get_new_top_k(
     k: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Get top k values and indices from two sets of values/indices."""
+    # Merge "existing top-k" and "current-batch top-k", then keep global top-k.
+    # Shapes:
+    #   first_values/second_values: [d_sae, k]
+    #   output new_values/new_indices: [d_sae, k]
     total_values = torch.cat([first_values, second_values], dim=1)
     total_indices = torch.cat([first_indices, second_indices], dim=1)
     new_values, indices_of_indices = torch.topk(total_values, k=k, dim=1)
@@ -49,6 +61,8 @@ def compute_sae_statistics(
     sae_activations: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute mean activations and sparsity statistics for SAE features."""
+    # sae_activations shape: [d_sae, batch]
+    # mean_acts is actually "sum of activations over batch" and is normalized later.
     mean_acts = sae_activations.sum(dim=1)
     sparsity = (sae_activations > 0).sum(dim=1)
     return mean_acts, sparsity
@@ -58,8 +72,10 @@ def get_top_activations(
     sae_activations: torch.Tensor, num_top_images: int, images_processed: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Get top activating images and their indices."""
+    # top_k cannot exceed current batch size.
     top_k = min(num_top_images, sae_activations.size(1))
     values, indices = torch.topk(sae_activations, k=top_k, dim=1)
+    # Convert batch-local indices to dataset-global indices.
     indices += images_processed
     return values, indices
 
@@ -75,19 +91,21 @@ def process_batch(
     storage: Dict[str, torch.Tensor],
 ) -> Tuple[Dict[str, torch.Tensor], int]:
     """Process a single batch of images and update feature statistics."""
-    # Get model activations
+    # 1) Image -> ViT activations -> SAE latent activations.
+    # `batch` is a Hugging Face dict-of-lists (not a PyTorch tensor batch).
     inputs = process_model_inputs(batch, vit, device)
     model_acts = get_model_activations(
         vit, inputs, cfg.block_layer, cfg.module_name, cfg.class_token
     )
+    # get_sae_activations returns [batch, d_sae]; transpose -> [d_sae, batch]
     sae_acts = get_sae_activations(model_acts, sae).transpose(0, 1)
 
-    # Update statistics
+    # 2) Update running sums/counters.
     mean_acts, sparsity = compute_sae_statistics(sae_acts)
     storage["sae_mean_acts"] += mean_acts
     storage["sae_sparsity"] += sparsity
 
-    # Get top activating images
+    # 3) Update per-latent global top-N images.
     values, indices = get_top_activations(sae_acts, num_top_images, images_processed)
 
     top_values, top_indices = get_new_top_k(
@@ -98,8 +116,10 @@ def process_batch(
         num_top_images,
     )
 
-    # Update processed image count
-    images_processed += model_acts.size(0)
+    # 4) Update how many images have been processed so far.
+    # Use raw batch image count (not activation tensor shape), so class-token
+    # mode and backbone-specific tensor layouts cannot skew global indices.
+    images_processed += len(batch["image"])
 
     return {
         "max_activating_image_values": top_values,
@@ -116,12 +136,17 @@ def save_results(
     label_field: Optional[str] = None,
 ) -> None:
     """Save results to disk."""
+    # Optional label lookup for visualization/debug.
+    # This can be slow because it dereferences dataset rows one by one.
     if label_field and label_field in dataset.features:
+        flat_indices = storage["max_activating_image_indices"].flatten()
+        # Safety guard against unexpected out-of-range indices.
+        flat_indices = flat_indices.clamp(min=0, max=len(dataset) - 1).to(torch.long)
         max_activating_image_label_indices = torch.tensor(
             [
                 dataset[int(index)][label_field]
                 for index in tqdm(
-                    storage["max_activating_image_indices"].flatten(),
+                    flat_indices,
                     desc="getting image labels",
                 )
             ]
@@ -143,6 +168,11 @@ def save_results(
     torch.save(storage["sae_sparsity"], f"{save_directory}/sae_sparsity.pt")
     torch.save(storage["sae_mean_acts"], f"{save_directory}/sae_mean_acts.pt")
 
+    # Files saved:
+    # - max_activating_image_indices.pt : [d_sae, top_n] image ids
+    # - max_activating_image_values.pt  : [d_sae, top_n] activation values
+    # - sae_sparsity.pt                 : [d_sae] activation frequency
+    # - sae_mean_acts.pt                : [d_sae] mean activation on active samples
     print(f"Results saved to {save_directory}")
 
 
@@ -162,9 +192,12 @@ def main(
     config_path: str = None,
 ):
     """Main function to extract and save feature data."""
+    # Use better fp32 matmul kernel when available.
     torch.set_float32_matmul_precision("high")
     torch.cuda.empty_cache()
 
+    # Shuffle only affects tie-break style of top-activating images.
+    # Aggregate statistics (means/sparsity) remain distributional properties.
     dataset = load_dataset(**DATASET_INFO[dataset_name])
     dataset = dataset.shuffle(seed=seed)
     classnames = get_classnames(dataset_name, dataset)
@@ -177,8 +210,9 @@ def main(
         sae.cfg.d_sae, number_of_max_activating_images, device
     )
 
-    # Process batches
+    # Process full dataset in batches and accumulate statistics.
     total_iterations = (len(dataset) + batch_size - 1) // batch_size
+    # Number of samples actually consumed so far.
     num_processed = 0
 
     for iteration in tqdm(range(total_iterations)):
@@ -197,11 +231,15 @@ def main(
             storage,
         )
 
-    # Finalize statistics
+    # Convert running sums/counters into final metrics.
+    # Note: sae_mean_acts is divided by activation count per latent.
+    # If a latent is never active, division can produce inf/nan for that latent.
+    # This is expected in sparse settings and can be handled downstream if needed.
     storage["sae_mean_acts"] /= storage["sae_sparsity"]
+    # sae_sparsity becomes activation frequency per latent over all samples.
     storage["sae_sparsity"] /= num_processed
 
-    # Save results
+    # Save final tensors to the standardized output directory.
     save_directory = setup_save_directory(
         root_dir, save_name, sae_path, vit_type, dataset_name
     )

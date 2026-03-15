@@ -22,6 +22,10 @@ from transformer_lens.hook_points import HookedRootModule, HookPoint
 from src.sae_training.config import ViTSAERunnerConfig
 
 
+# SparseAutoencoder high-level flow:
+# 1) encode dense ViT activation x to sparse latent features;
+# 2) decode features back to reconstruction of x;
+# 3) optimize reconstruction + sparsity (+ optional ghost-grad auxiliary loss).
 class SparseAutoencoder(HookedRootModule):
     """ """
 
@@ -46,15 +50,18 @@ class SparseAutoencoder(HookedRootModule):
         self.debug_numerics = bool(getattr(cfg, "debug_numerics", False))
 
         # NOTE: if using resampling neurons method, you must ensure that we initialise the weights in the order W_enc, b_enc, W_dec, b_dec
+        # W_enc: [d_in, d_sae] maps input activation -> latent pre-activation.
         self.W_enc = nn.Parameter(
             torch.nn.init.kaiming_uniform_(
                 torch.empty(self.d_in, self.d_sae, dtype=self.dtype, device=self.device)
             )
         )
+        # b_enc: [d_sae] encoder bias per latent dimension.
         self.b_enc = nn.Parameter(
             torch.zeros(self.d_sae, dtype=self.dtype, device=self.device)
         )
 
+        # W_dec: [d_sae, d_in] maps sparse features back to activation space.
         self.W_dec = nn.Parameter(
             torch.nn.init.kaiming_uniform_(
                 torch.empty(self.d_sae, self.d_in, dtype=self.dtype, device=self.device)
@@ -62,6 +69,7 @@ class SparseAutoencoder(HookedRootModule):
         )
 
         if self.cfg.gated_sae:
+            # Optional gated-SAE parameters (not used in current forward path).
             self.r_mag = nn.Parameter(
                 torch.zeros(self.d_sae, dtype=self.dtype, device=self.device)
             )
@@ -72,14 +80,17 @@ class SparseAutoencoder(HookedRootModule):
 
         with torch.no_grad():
             # Anthropic normalize this to have unit columns
+            # Unit-norm decoder rows helps avoid scale degeneracy.
             self.W_dec.data /= torch.norm(self.W_dec.data, dim=1, keepdim=True).clamp_min(
                 self.norm_eps
             )
 
+        # b_dec: [d_in] decoder bias (also subtracted before encoding).
         self.b_dec = nn.Parameter(
             torch.zeros(self.d_in, dtype=self.dtype, device=self.device)
         )
 
+        # Hook points allow external code to cache/inspect internal tensors.
         self.hook_sae_in = HookPoint()
         self.hook_hidden_pre = HookPoint()
         self.hook_hidden_post = HookPoint()
@@ -88,6 +99,7 @@ class SparseAutoencoder(HookedRootModule):
         self.setup()  # Required for `HookedRootModule`s
 
     def _check_finite(self, tensor: Tensor, name: str) -> None:
+        # Debug guard: raise immediately on NaN/Inf with useful stats.
         if not self.debug_numerics:
             return
         finite_mask = torch.isfinite(tensor)
@@ -105,12 +117,14 @@ class SparseAutoencoder(HookedRootModule):
         )
 
     def forward(self, x, dead_neuron_mask=None):
+        # Entry point: choose implementation by config.
         if self.cfg.gated_sae:
             return self.forward_gated(x, dead_neuron_mask)
         else:
             return self.forward_standard(x, dead_neuron_mask)
 
     def forward_standard(self, x, dead_neuron_mask=None):
+        # Ensure all SAE math runs in configured dtype.
         x = x.to(self.dtype)
         self._check_finite(x, "x")
 
@@ -143,6 +157,7 @@ class SparseAutoencoder(HookedRootModule):
 
         # add config for whether l2 is normalized:
         x_float = x.float()
+        # Per-sample norm used to scale reconstruction error.
         x_norm = x_float.pow(2).sum(dim=-1, keepdim=True).sqrt().clamp_min(
             self.norm_eps
         )
@@ -152,6 +167,7 @@ class SparseAutoencoder(HookedRootModule):
         )
         self._check_finite(mse_loss, "mse_loss_pre_cls_scale")
 
+        # Optional extra loss term used only when ghost grads are enabled.
         mse_loss_ghost_resid = torch.tensor(0.0, dtype=self.dtype, device=self.device)
         # gate on config and training so evals is not slowed down.
         if (
@@ -164,11 +180,13 @@ class SparseAutoencoder(HookedRootModule):
             # ghost protocol
 
             # 1.
+            # Residual that SAE failed to reconstruct.
             residual = x_float - sae_out.float()
             l2_norm_residual = torch.norm(residual, dim=-1)
             self._check_finite(residual, "ghost/residual")
 
             # 2.
+            # Build activations only on dead-neuron subset.
             if len(hidden_pre.size()) == 3:
                 dead_hidden_pre = hidden_pre[:, :, dead_neuron_mask].float()
                 dead_hidden_pre = dead_hidden_pre.clamp(
@@ -183,6 +201,7 @@ class SparseAutoencoder(HookedRootModule):
             self._check_finite(
                 feature_acts_dead_neurons_only, "ghost/feature_acts_dead_neurons_only"
             )
+            # Decode using only dead-neuron decoder rows.
             ghost_out = feature_acts_dead_neurons_only @ self.W_dec[dead_neuron_mask, :].float()
             l2_norm_ghost_out = torch.norm(ghost_out, dim=-1).clamp_min(self.norm_eps)
             norm_scaling_factor = l2_norm_residual / (
@@ -195,6 +214,7 @@ class SparseAutoencoder(HookedRootModule):
             self._check_finite(ghost_out, "ghost/ghost_out")
 
             # 3.
+            # Compare ghost reconstruction to detached residual target.
             residual_detached = residual.detach()
             residual_norm = residual_detached.pow(2).sum(dim=-1, keepdim=True).sqrt().clamp_min(
                 self.norm_eps
@@ -206,6 +226,7 @@ class SparseAutoencoder(HookedRootModule):
             mse_rescaling_factor = (
                 mse_loss.detach().float() / (mse_loss_ghost_resid + self.norm_eps)
             ).detach()
+            # Guard any division instability.
             mse_rescaling_factor = torch.nan_to_num(
                 mse_rescaling_factor, nan=0.0, posinf=0.0, neginf=0.0
             )
@@ -218,11 +239,13 @@ class SparseAutoencoder(HookedRootModule):
         mse_loss_ghost_resid = mse_loss_ghost_resid.mean()
 
         # mse_loss shape is (batch_size, token_length, sae_dim), then multiply mse_cls_coeff to [:, 0, :]
+        # This upweights reconstruction error on CLS token for sequence inputs.
         if len(mse_loss.size()) == 3 and self.training:
             mse_loss[:, 0, :] = mse_loss[:, 0, :] * self.cfg.mse_cls_coefficient
 
         mse_loss = torch.nan_to_num(mse_loss, nan=0.0, posinf=0.0, neginf=0.0)
         mse_loss = mse_loss.mean()
+        # L1 penalty on latent activations encourages sparsity.
         sparsity = torch.abs(feature_acts).sum(dim=-1).mean(dim=(0,))
         l1_loss = self.l1_coefficient * sparsity
         loss = mse_loss + l1_loss + mse_loss_ghost_resid
@@ -241,6 +264,8 @@ class SparseAutoencoder(HookedRootModule):
         self, x, dead_neuron_mask=None, clamp_feat_dim=None, clamp_value=10
     ):
         # move x to correct dtype
+        # This path is used for intervention experiments (feature on/off masking),
+        # not for standard SAE training updates.
         x = x.to(self.dtype)
         sae_in = self.hook_sae_in(
             x - self.b_dec
@@ -264,6 +289,9 @@ class SparseAutoencoder(HookedRootModule):
         feature_acts = (
             feature_acts[:, :, clamp_feat_dim] * clamp_value
         )  # TODO: check if this is compatabile for both cls and non-cls SAE
+        # Expected behavior:
+        # - clamp_feat_dim is boolean/select mask over latent dims.
+        # - clamp_value is scalar or vector to keep/suppress selected features.
 
         sae_out = self.hook_sae_out(
             einops.einsum(
@@ -312,6 +340,7 @@ class SparseAutoencoder(HookedRootModule):
 
         mse_loss_ghost_resid = mse_loss_ghost_resid.mean()
         mse_loss = mse_loss.mean()
+        # Keep same objective structure as forward_standard for monitoring.
         sparsity = torch.abs(feature_acts).sum(dim=1).mean(dim=(0,))
         l1_loss = self.l1_coefficient * sparsity
         loss = mse_loss + l1_loss + mse_loss_ghost_resid
@@ -323,6 +352,7 @@ class SparseAutoencoder(HookedRootModule):
 
     @torch.no_grad()
     def initialize_b_dec(self, activation_store):
+        # Decoder-bias initialization strategy.
         if self.cfg.b_dec_init_method == "geometric_median":
             self.initialize_b_dec_with_geometric_median(activation_store)
         elif self.cfg.b_dec_init_method == "mean":
@@ -336,6 +366,7 @@ class SparseAutoencoder(HookedRootModule):
 
     @torch.no_grad()
     def initialize_b_dec_with_geometric_median(self, activation_store, maxiter=100):
+        # Geometric median is often more robust to outliers than arithmetic mean.
         previous_b_dec = self.b_dec.clone().cpu()
         all_activations = activation_store.get_batch_activations().detach().cpu()
         out = compute_geometric_median(
@@ -343,6 +374,7 @@ class SparseAutoencoder(HookedRootModule):
         ).median
 
         if len(out.shape) == 2:
+            # If sequence dimension exists, average across tokens.
             out = out.mean(dim=0)
             # out = out.view(-1)
 
@@ -364,6 +396,7 @@ class SparseAutoencoder(HookedRootModule):
 
     @torch.no_grad()
     def initialize_b_dec_with_mean(self, activation_store):
+        # Simpler baseline initialization: plain mean activation.
         previous_b_dec = self.b_dec.clone().cpu()
         all_activations = activation_store.get_batch_activations().detach().cpu()
         out = all_activations.mean(dim=0)
@@ -394,6 +427,7 @@ class SparseAutoencoder(HookedRootModule):
 
         feature_reinit_scale = self.cfg.feature_reinit_scale
 
+        # Compute current per-sample reconstruction error.
         sae_out, _, _, _, _ = self.forward(x)
         per_token_l2_loss = (sae_out - x).pow(2).sum(dim=-1).squeeze()
 
@@ -431,6 +465,7 @@ class SparseAutoencoder(HookedRootModule):
         )
 
         # St new decoder weights
+        # New decoder directions point toward high-loss examples.
         self.W_dec.data[is_dead, :] = replacement_values
 
         # Get the norm of alive neurons (or 1.0 if there are no alive neurons)
@@ -441,6 +476,7 @@ class SparseAutoencoder(HookedRootModule):
         )
 
         # Lastly, set the new weights & biases
+        # Encoder columns are aligned with new decoder directions.
         self.W_enc.data[:, is_dead] = (
             replacement_values * W_enc_norm_alive_mean * feature_reinit_scale
         ).T
@@ -493,6 +529,7 @@ class SparseAutoencoder(HookedRootModule):
         )
 
         # sample according to losses
+        # Higher loss increase => higher probability to be selected as reset seed.
         probs = global_loss_increases / global_loss_increases.sum()
         sample_indices = torch.multinomial(
             probs,
@@ -504,6 +541,7 @@ class SparseAutoencoder(HookedRootModule):
             dead_neuron_indices = dead_neuron_indices[: sample_indices.shape[0]]
 
         # Replace W_dec with normalized differences in activations
+        # This sets dead neurons to represent informative directions.
         self.W_dec.data[dead_neuron_indices, :] = (
             (
                 global_input_activations[sample_indices]
@@ -516,6 +554,7 @@ class SparseAutoencoder(HookedRootModule):
         )
 
         # Lastly, set the new weights & biases
+        # Reset encoder to match decoder and clear biases for resampled units.
         self.W_enc.data[:, dead_neuron_indices] = self.W_dec.data[
             dead_neuron_indices, :
         ].T
@@ -621,10 +660,12 @@ class SparseAutoencoder(HookedRootModule):
                 ]
 
             # calculate the difference in loss
+            # Positive value means SAE reconstruction made token prediction worse.
             changes_in_loss = ce_loss_with_recons - ce_loss_without_recons
             changes_in_loss = changes_in_loss.cpu()
 
             # sample from the loss differences
+            # ReLU ensures probabilities are non-negative.
             probs = F.relu(changes_in_loss) / F.relu(changes_in_loss).sum(
                 dim=1, keepdim=True
             )
@@ -654,10 +695,12 @@ class SparseAutoencoder(HookedRootModule):
         head_index = self.cfg.hook_point_head_index
 
         def standard_replacement_hook(activations, hook):
+            # Replace full hooked activation tensor with SAE reconstruction.
             activations = self.forward(activations)[0].to(activations.dtype)
             return activations
 
         def head_replacement_hook(activations, hook):
+            # Replace only one attention head slice when head_index is set.
             new_actions = self.forward(activations[:, :, head_index])[0].to(
                 activations.dtype
             )
@@ -678,6 +721,7 @@ class SparseAutoencoder(HookedRootModule):
 
     @torch.no_grad()
     def set_decoder_norm_to_unit_norm(self):
+        # Keep decoder rows on unit sphere to stabilize scale.
         self.W_dec.data /= torch.norm(self.W_dec.data, dim=1, keepdim=True).clamp_min(
             self.norm_eps
         )
@@ -772,6 +816,7 @@ class SparseAutoencoder(HookedRootModule):
             )
 
         # Create an instance of the class using the loaded configuration
+        # Then load learned tensor weights.
         instance = cls(cfg=state_dict["cfg"])
         instance.load_state_dict(state_dict["state_dict"])
 
