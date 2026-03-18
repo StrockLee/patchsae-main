@@ -1,9 +1,11 @@
 import argparse
+from pathlib import Path
 
 import gradio as gr
 import numpy as np
 import plotly.graph_objects as go
 import torch
+from gradio_client import utils as gr_client_utils
 from PIL import Image, ImageDraw
 from plotly.subplots import make_subplots
 
@@ -12,6 +14,19 @@ from src.demo.utils import load_sae_tester
 IMAGE_SIZE = 400
 DATASET_LIST = ["imagenet"]
 GRID_NUM = 14
+
+# Gradio 5.8.0 may emit JSON schema fragments where `additionalProperties` is bool.
+# gradio_client 1.5.1 expects dict-like schema nodes and crashes on bool.
+_orig_schema_to_pytype = gr_client_utils._json_schema_to_python_type
+
+
+def _safe_schema_to_pytype(schema, defs=None):
+    if isinstance(schema, bool):
+        return "Any"
+    return _orig_schema_to_pytype(schema, defs)
+
+
+gr_client_utils._json_schema_to_python_type = _safe_schema_to_pytype
 
 
 def get_grid_loc(evt, image):
@@ -27,11 +42,11 @@ def get_grid_loc(evt, image):
 
 
 def plot_activation(
-    evt: gr.EventData,
+    evt,
     current_image,
     activation,
-    model_name: str,
-    colors: tuple[str, str],
+    model_name,
+    colors,
 ):
     """Plot activation distribution for the full image and optionally a selected tile"""
     mean_activation = activation.mean(0)
@@ -127,9 +142,7 @@ def add_activation_trace(fig, activation, label, color, top_k):
         )
 
 
-def plot_activation_distribution(
-    evt: gr.EventData, current_image, clip_act, maple_act, model_name: str
-):
+def plot_activation_distribution(evt, current_image, clip_act, maple_act, model_name):
     fig = make_subplots(
         rows=2,
         cols=1,
@@ -279,7 +292,7 @@ def load_image_and_act(image, clip_act, maple_act, model_name):
     )
 
 
-def highlight_grid(evt: gr.EventData, image, clip_act, maple_act, model_name):
+def highlight_grid(image, clip_act, maple_act, model_name, evt: gr.SelectData):
     grid_x, grid_y, cell_width, cell_height = get_grid_loc(evt, image)
 
     highlighted_image = image.copy()
@@ -405,20 +418,67 @@ if __name__ == "__main__":
         default=False,
         help="Include ImageNet in the Demo",
     )
+    parser.add_argument(
+        "--sae_path",
+        type=str,
+        default="./data/sae_weight/base/out.pt",
+        help="Path to SAE checkpoint (.pt). In bundle mode this can be omitted if auto-detection is unambiguous.",
+    )
+    parser.add_argument(
+        "--feature_bundle_dir",
+        type=str,
+        default=None,
+        help="Single-folder mode. Directory containing checkpoint + feature files "
+        "(max_activating_image_indices.pt, max_activating_image_values.pt, sae_mean_acts.pt).",
+    )
+    parser.add_argument(
+        "--server_name",
+        type=str,
+        default="0.0.0.0",
+        help="Gradio server host.",
+    )
+    parser.add_argument(
+        "--server_port",
+        type=int,
+        default=7860,
+        help="Gradio server port.",
+    )
+    parser.add_argument(
+        "--share",
+        action="store_true",
+        default=False,
+        help="Create a public Gradio link if local networking is restricted.",
+    )
     args = parser.parse_args()
 
-    sae_tester = load_sae_tester("./data/sae_weight/base/out.pt", args.include_imagenet)
+    single_bundle_mode = bool(args.feature_bundle_dir and str(args.feature_bundle_dir).strip())
+    sae_tester = load_sae_tester(
+        sae_path=args.sae_path,
+        include_imagenet=args.include_imagenet,
+        feature_bundle_dir=args.feature_bundle_dir,
+    )
+
     sae_data_dict = {"mean_act_values": {}}
-    if args.include_imagenet:
-        REF_DATASET_LIST = ["imagenet", "imagenet-sketch", "caltech101"]
-    else:
-        REF_DATASET_LIST = ["imagenet-sketch", "caltech101"]
-    for dataset in ["imagenet", "imagenet-sketch", "caltech101"]:
-        data = torch.load(
-            f"./out/feature_data/sae_base/base/{dataset}/max_activating_image_values.pt",
-            map_location="cpu",
+    if single_bundle_mode:
+        REF_DATASET_LIST = ["imagenet"]
+        bundle = Path(args.feature_bundle_dir)
+        value_path = bundle / "max_activating_image_values.pt"
+        if not value_path.exists():
+            raise FileNotFoundError(f"Missing file in feature_bundle_dir: {value_path}")
+        sae_data_dict["mean_act_values"]["imagenet"] = torch.load(
+            value_path, map_location="cpu"
         )
-        sae_data_dict["mean_act_values"][dataset] = data
+    else:
+        if args.include_imagenet:
+            REF_DATASET_LIST = ["imagenet", "imagenet-sketch", "caltech101"]
+        else:
+            REF_DATASET_LIST = ["imagenet-sketch", "caltech101"]
+        for dataset in REF_DATASET_LIST:
+            data = torch.load(
+                f"./out/feature_data/sae_base/base/{dataset}/max_activating_image_values.pt",
+                map_location="cpu",
+            )
+            sae_data_dict["mean_act_values"][dataset] = data
 
     with gr.Blocks(
         theme=gr.themes.Citrus(),
@@ -524,4 +584,8 @@ if __name__ == "__main__":
             outputs=outputs,
         )
 
-    demo.launch()
+    demo.launch(
+        server_name=args.server_name,
+        server_port=args.server_port,
+        share=args.share,
+    )

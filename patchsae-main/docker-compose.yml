@@ -21,3 +21,5 @@ services:
       MPLCONFIGDIR: /workspace/out/matplotlib
     volumes:
       - ./:/workspace
+    ports:
+      - "7860:7860"

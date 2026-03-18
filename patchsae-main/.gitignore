@@ -7,3 +7,4 @@ out/
 wandb/
 logs/
 configs/models/maple/model.pth.*
+all_direct_product/
