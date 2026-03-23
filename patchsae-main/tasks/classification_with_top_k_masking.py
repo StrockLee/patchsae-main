@@ -87,7 +87,8 @@ def create_sae_hooks(vit_type, cfg, cls_features, sae, device, hook_type="on"):
             )[0]
             - SAE_BIAS
         )
-        return processed
+        # Keep original dtype to avoid Float/Half mismatches in MaPLe attention layers.
+        return processed.to(act.dtype)
 
     def hook_fn_default(activations):
         # In-place replacement of block activations for CLIP/base model.

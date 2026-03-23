@@ -42,14 +42,39 @@ class Hook:
 
     def get_full_hook_fn(self, hook_fn: Callable):
         def full_hook_fn(module, module_input, module_output):
-            # For CLIP blocks, output is typically a tuple where index 0 is tensor.
-            hook_fn_output = hook_fn(module_output[0])
+            # For CLIP blocks, output is typically a tuple whose first element is activations.
+            # For MaPLe blocks, output is a list: [activations, compound_prompts_deeper, counter].
+            if isinstance(module_output, (tuple, list)) and len(module_output) > 0:
+                activations = module_output[0]
+            else:
+                activations = module_output
+
+            hook_fn_output = hook_fn(activations)
+
+            # Backward compatibility: some existing hooks return `(activations,)`.
+            if isinstance(hook_fn_output, (tuple, list)) and len(hook_fn_output) == 1:
+                hook_fn_output = hook_fn_output[0]
+
             if self.return_module_output:
                 # Keep original module output unchanged.
                 return module_output
-            else:
-                # Replace module output with hooked tensor.
-                return hook_fn_output  # Inexplicably, the module output is not a tensor of activaitons but a tuple (tensor,)...??
+
+            # When module output is composite (tuple/list), replace only the first
+            # activation tensor and keep the auxiliary state (e.g., MaPLe counter).
+            if isinstance(module_output, tuple):
+                if len(module_output) == 0:
+                    return module_output
+                return (hook_fn_output, *module_output[1:])
+
+            if isinstance(module_output, list):
+                if len(module_output) == 0:
+                    return module_output
+                output = list(module_output)
+                output[0] = hook_fn_output
+                return output
+
+            # Plain tensor output: directly replace with hooked activations.
+            return hook_fn_output
 
         return full_hook_fn
 
